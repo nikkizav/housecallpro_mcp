@@ -1,0 +1,24 @@
+{
+  "preferences": {
+    "coworkScheduledTasksEnabled": true,
+    "ccdScheduledTasksEnabled": true,
+    "sidebarMode": "code",
+    "coworkWebSearchEnabled": true
+  },
+  "mcpServers": {
+    "housecall-pro-lhstl": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/path/to/housecallpro_mcp",
+        "python",
+        "/path/to/housecallpro_mcp/housecallpro_LHSTL.py"
+      ],
+      "env": {
+        "HOUSECALL_PRO_API_KEY": "your_api_key_here"
+      }
+    }
+  },
+  "_note": "This is a template with the real API key and file paths removed. Copy the 'housecall-pro-lhstl' block (or the other per-resource server blocks from your own working config) for each MCP server you need, update the /path/to/housecallpro_mcp paths to match this machine, and fill in your own HOUSECALL_PRO_API_KEY. Find your key in Housecall Pro > Settings > Integrations > API (requires the MAX plan)."
+}

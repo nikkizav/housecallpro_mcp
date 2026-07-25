@@ -1,0 +1,11 @@
+# Secrets — never commit real credentials
+.env
+claude_desktop_config_snippet.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
