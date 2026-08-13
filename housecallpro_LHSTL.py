@@ -15,6 +15,7 @@ that file — no code changes required here.
 import asyncio
 import json
 import re
+import time
 from datetime import date, timedelta, datetime as dt
 from pathlib import Path
 from typing import Any, Optional
@@ -150,6 +151,96 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict) -> Any:
     return resp.json()
 
 
+# ── Throttled bulk fetching ────────────────────────────────────────────────────
+#
+# HCP rate-limits fan-out: firing two requests per job across ~50 jobs reliably
+# draws HTTP 429s.  Gathering those with return_exceptions=True and treating a
+# failure as an empty payload is silently corrupting — a throttled run reports
+# "0.0 quoted hours" and "no appointments" for the jobs that failed, which reads
+# as real data.  Cap concurrency, retry the throttled calls, and hand back any
+# error so the caller can exclude the job and say so.
+
+_HCP_FANOUT  = 4   # concurrent in-flight requests when looping over many jobs
+_HCP_RETRIES = 6
+
+
+class _RateGate:
+    """Process-wide pause shared by every in-flight request.
+
+    The limit is global to the account, so one worker hitting a 429 means the
+    others are about to as well.  Independent per-request backoff just burns the
+    remaining budget; holding everyone back for the same window recovers far
+    more reliably.
+    """
+
+    def __init__(self) -> None:
+        self._until = 0.0
+
+    async def wait(self) -> None:
+        while True:
+            remaining = self._until - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 5.0))
+
+    def penalize(self, seconds: float) -> None:
+        self._until = max(self._until, time.monotonic() + seconds)
+
+
+_RATE_GATE = _RateGate()
+
+
+async def _get_json(client: httpx.AsyncClient, path: str,
+                    params: dict | None = None,
+                    attempts: int = _HCP_RETRIES) -> tuple[Any, str | None]:
+    """GET one path with shared backoff on 429/5xx.  Returns (payload, error)."""
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    delay = 1.0
+    for i in range(attempts):
+        await _RATE_GATE.wait()
+        try:
+            resp = await client.get(path, params=clean)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if i == attempts - 1:
+                    return None, f"HTTP {resp.status_code}"
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else delay
+                except ValueError:
+                    wait = delay
+                wait = min(wait, 30.0)
+                _RATE_GATE.penalize(wait)   # hold every worker, not just this one
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, 30.0)
+                continue
+            resp.raise_for_status()
+            return resp.json(), None
+        except httpx.HTTPStatusError as e:
+            return None, f"HTTP {e.response.status_code}"
+        except Exception as e:  # transport errors are worth one more try
+            if i == attempts - 1:
+                return None, type(e).__name__
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+    return None, "retries exhausted"
+
+
+async def _fanout_jobs(client: httpx.AsyncClient, jobs: list[dict],
+                       suffixes: list[str],
+                       limit: int = _HCP_FANOUT) -> list[list[tuple[Any, str | None]]]:
+    """For each job fetch every suffix path, capped at `limit` concurrent requests."""
+    sem = asyncio.Semaphore(limit)
+
+    async def one(job: dict) -> list[tuple[Any, str | None]]:
+        async with sem:
+            results = []
+            for suffix in suffixes:
+                results.append(await _get_json(client, f"/jobs/{job['id']}{suffix}"))
+            return results
+
+    return await asyncio.gather(*[one(j) for j in jobs])
+
+
 def _hcp_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=BASE_URL, headers=get_headers(), timeout=30.0)
 
@@ -163,6 +254,263 @@ def _parse_hours(s: str, e: str, fallback: float = 8.0) -> float:
         return max(0.0, (e_dt - s_dt).total_seconds() / 3600)
     except Exception:
         return fallback
+
+
+def _invoiced_note(item: dict) -> str:
+    """Flag line items only partly allocated to this invoice.
+
+    Jobs split across progress or linked invoices carry the full line-item
+    `amount` but only `invoiced_amount` of it lands on this invoice.
+    """
+    invoiced = item.get("invoiced_amount")
+    if invoiced is None or invoiced == item.get("amount"):
+        return ""
+    return f"  (on this invoice: {_dollars(invoiced)})"
+
+
+def _sched(schedule: dict | None) -> tuple[str | None, str | None, int | None]:
+    """Pull (start, end, arrival_window_minutes) off a Job or Estimate schedule.
+
+    Jobs/estimates return scheduled_start/scheduled_end/arrival_window; the
+    PUT /jobs/{id}/schedule response and Event objects use start_time/end_time/
+    arrival_window_minutes.  Accept either so callers do not have to care.
+    """
+    s = schedule or {}
+    return (
+        s.get("scheduled_start") or s.get("start_time"),
+        s.get("scheduled_end") or s.get("end_time"),
+        s.get("arrival_window") if s.get("arrival_window") is not None
+        else s.get("arrival_window_minutes"),
+    )
+
+
+# ── Per-day actual-time model ──────────────────────────────────────────────────
+#
+# HCP gives us exactly one started_at / completed_at pair per JOB — never per
+# appointment (confirmed against the v1-4 Appointment schema, which carries only
+# start_time / end_time / dispatched_employees_ids).  Measuring a multi-day job
+# as one first-start-to-last-complete span therefore produces nonsense: a job
+# worked over two weeks reads as 300+ hours.
+#
+# Instead we build a per-DAY skeleton from the appointments and anchor only its
+# outer edges with the real timestamps:
+#
+#     day 1     : real started_at   → scheduled end
+#     middle    : scheduled window  (no data exists — this is inference)
+#     last day  : scheduled start   → real completed_at
+#
+# Measured against 263 completed jobs, started_at lands within tolerance of the
+# first appointment 109/130 times and completed_at within tolerance of the last
+# 121/133 times, so the anchors are trustworthy; the failures are detectable and
+# get flagged rather than averaged in.  `coverage` reports the share of day
+# boundaries backed by a real timestamp so a caller can tell a fully measured
+# single-day job from a ten-day job with two anchored edges.
+
+
+def _time_model(cfg: dict | None = None) -> dict:
+    """Tolerances and the lunch deduction, all overridable from lhstl_config.json."""
+    s = (cfg if cfg is not None else _load_config()).get("scheduling", {})
+    window     = float(s.get("appointment_window_hours", 8.5))
+    productive = float(s.get("productive_hours_per_day", 8.0))
+    return {
+        # 8.5h booked window - 8.0h productive = 30 min unpaid break
+        "lunch":        max(0.0, window - productive),
+        "full_day_min": float(s.get("full_day_min_hours", 6.0)),
+        "anchor_tol":   float(s.get("anchor_tolerance_hours", 4.0)),
+        "early_tol":    float(s.get("early_finish_tolerance_hours", 24.0)),
+        "cluster_gap":  int(s.get("cluster_gap_days", 7)),
+    }
+
+
+def _dtp(s: str | None) -> dt | None:
+    """Parse an HCP ISO timestamp, tolerating the trailing Z.  None on failure."""
+    if not s:
+        return None
+    try:
+        return dt.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _span_h(a: dt | None, b: dt | None) -> float | None:
+    return (b - a).total_seconds() / 3600 if a and b else None
+
+
+def _net_day_hours(h: float, tm: dict) -> float:
+    """Clock hours minus the unpaid break, for any day long enough to take one."""
+    if h >= tm["full_day_min"]:
+        h -= tm["lunch"]
+    return max(0.0, h)
+
+
+def _appt_crew(appt: dict) -> int:
+    """Techs on one appointment.  Objects when fetched via _hcp_client, else ids."""
+    emp = appt.get("assigned_employees")
+    if isinstance(emp, list) and emp and isinstance(emp[0], dict):
+        return len(emp)
+    return len(appt.get("dispatched_employees_ids") or []) or 0
+
+
+def _day_skeleton(job: dict, appts: list[dict]) -> tuple[list[dict], str]:
+    """Work days as [{start, end, techs}], plus the source we derived them from.
+
+    Appointments are the only reliable per-day record.  With none, a single-day
+    job.schedule still gives us one usable day; a MULTI-day job.schedule does
+    not, because nothing says which of those days were actually worked.
+    """
+    usable = [a for a in (appts or [])
+              if a.get("start_time") and a.get("end_time")]
+    if usable:
+        usable.sort(key=lambda a: a["start_time"])
+        days = []
+        for a in usable:
+            s, e = _dtp(a["start_time"]), _dtp(a["end_time"])
+            if s and e:
+                days.append({"start": s, "end": e, "techs": _appt_crew(a) or 1})
+        if days:
+            return days, "appointments"
+
+    s_raw, e_raw, _ = _sched(job.get("schedule"))
+    s, e = _dtp(s_raw), _dtp(e_raw)
+    if not (s and e):
+        return [], "none"
+    techs = len(job.get("assigned_employees") or []) or 1
+    if s.date() == e.date():
+        return [{"start": s, "end": e, "techs": techs}], "job_schedule_1day"
+    return [], "job_schedule_multiday"
+
+
+def _estimate_job_time(job: dict, appts: list[dict], line_items: list[dict],
+                       tm: dict) -> dict:
+    """Quoted / scheduled / actual tech-hours for one job, with a confidence grade.
+
+    Grades:
+      measured     — single day, both edges backed by real timestamps
+      estimated    — multi-day, outer edges anchored, middle days from schedule
+      scheduled    — anchors unusable; 'actual' carries no information
+      unmeasurable — no per-day skeleton exists at all
+    """
+    quoted = sum(float(i.get("quantity") or 0)
+                 for i in (line_items or []) if i.get("kind") == "labor")
+    ts = job.get("work_timestamps") or {}
+    started, completed = _dtp(ts.get("started_at")), _dtp(ts.get("completed_at"))
+    days, src = _day_skeleton(job, appts)
+
+    out: dict[str, Any] = {
+        "quoted": quoted, "scheduled": None, "actual": None,
+        "grade": "unmeasurable", "coverage": 0.0, "flags": [],
+        "ndays": len(days), "source": src, "day_lines": [],
+    }
+    if not days:
+        out["flags"].append(
+            "multi-day span, no appointments" if src == "job_schedule_multiday"
+            else "no schedule on job"
+        )
+        return out
+
+    out["scheduled"] = sum(
+        _net_day_hours(_span_h(d["start"], d["end"]) or 0.0, tm) * d["techs"]
+        for d in days
+    )
+    if quoted and out["scheduled"] and quoted / out["scheduled"] > 2.0:
+        out["flags"].append("appointments incomplete (quoted >2x scheduled)")
+
+    # ── anchor the outer boundaries ───────────────────────────────────────────
+    first, last = days[0], days[-1]
+    a_start, a_end = first["start"], last["end"]
+    start_real = end_real = False
+
+    if started is not None:
+        dev = _span_h(first["start"], started)
+        if dev is not None and abs(dev) <= tm["anchor_tol"]:
+            a_start, start_real = started, True
+        else:
+            out["flags"].append("stale start" if (dev or 0) < 0 else "late start")
+
+    if completed is not None:
+        dev = _span_h(last["end"], completed)
+        # finishing early is a real, useful signal; finishing "late" past the
+        # tolerance is the tech doing paperwork hours after leaving site
+        if dev is not None and -tm["early_tol"] <= dev <= tm["anchor_tol"]:
+            a_end, end_real = completed, True
+        else:
+            out["flags"].append(
+                "closeout drift" if (dev or 0) > 0 else "completed off-day"
+            )
+
+    # A one-day job needs BOTH edges: with only an end anchor the duration is
+    # measured from a start we do not trust.  Job #460 (stale start 11 days old,
+    # completed 36 min into a 4.5h window) would otherwise read as 1.2 tech-hrs
+    # against 3.5 quoted.
+    if len(days) == 1 and not (start_real and end_real):
+        a_start, a_end = first["start"], last["end"]
+        start_real = end_real = False
+
+    total = 0.0
+    for i, d in enumerate(days):
+        s = a_start if (i == 0 and start_real) else d["start"]
+        e = a_end if (i == len(days) - 1 and end_real) else d["end"]
+        raw = _span_h(s, e)
+        if raw is None or raw < 0:
+            raw = _span_h(d["start"], d["end"]) or 0.0
+        net = _net_day_hours(raw, tm)
+        total += net * d["techs"]
+        edge = ("anchored" if (i == 0 and start_real) or
+                (i == len(days) - 1 and end_real) else "scheduled")
+        out["day_lines"].append(
+            f"    {d['start'].date()}  {net:4.1f}h × {d['techs']} tech(s)"
+            f" = {net * d['techs']:5.1f} tech-hrs  [{edge}]"
+        )
+
+    out["actual"] = total
+    out["coverage"] = (int(start_real) + int(end_real)) / (2 * len(days))
+    if len(days) == 1:
+        out["grade"] = "measured" if (start_real and end_real) else "scheduled"
+    elif start_real or end_real:
+        out["grade"] = "estimated"
+    else:
+        out["grade"] = "scheduled"
+    return out
+
+
+def _cluster_jobs(jobs: list[dict], tm: dict) -> list[list[dict]]:
+    """Group jobs that are really one project split across several HCP records.
+
+    Same customer and same address, with start dates inside cluster_gap days of
+    the running end date.  Returns only genuine groups (2+ jobs).
+    """
+    buckets: dict[tuple, list[dict]] = {}
+    for j in jobs:
+        key = ((j.get("customer") or {}).get("id"),
+               (j.get("address") or {}).get("id"))
+        if key == (None, None):
+            continue
+        buckets.setdefault(key, []).append(j)
+
+    groups: list[list[dict]] = []
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        dated = []
+        for j in members:
+            s_raw, e_raw, _ = _sched(j.get("schedule"))
+            s = _dtp(s_raw)
+            if s:
+                dated.append((s, _dtp(e_raw) or s, j))
+        dated.sort(key=lambda t: t[0])
+        run: list[dict] = []
+        run_end: dt | None = None
+        for s, e, j in dated:
+            if run and run_end is not None and s - run_end <= timedelta(days=tm["cluster_gap"]):
+                run.append(j)
+                run_end = max(run_end, e)
+            else:
+                if len(run) > 1:
+                    groups.append(run)
+                run, run_end = [j], e
+        if len(run) > 1:
+            groups.append(run)
+    return groups
 
 
 # ── SCH-tag priority constants (used by backlog + scheduler tools) ──────────────
@@ -381,7 +729,7 @@ async def hcp_list_jobs(
     for job in jobs:
         tags = job.get("tags", [])
         tg = _parse_tags(tags)
-        schedule = job.get("schedule") or {}
+        sch_start, sch_end, _ = _sched(job.get("schedule"))
         employees = job.get("assigned_employees", [])
         emp_names = (
             ", ".join(
@@ -401,7 +749,7 @@ async def hcp_list_jobs(
             + f"\n  Status: {job.get('work_status','?')}{ps_part}"
             f"  |  Total: {_dollars(job.get('total_amount'))}"
             f"  |  Outstanding: {_dollars(job.get('outstanding_balance'))}"
-            f"\n  Schedule: {schedule.get('start_time','?')} → {schedule.get('end_time','?')}"
+            f"\n  Schedule: {sch_start or 'unscheduled'} → {sch_end or '—'}"
             f"\n  Assigned: {emp_names}"
             f"  |  Crew: {_crew_summary(tg['crew'])}"
             f"\n  SCH: {', '.join(tg['scheduling']) or '—'}"
@@ -431,20 +779,37 @@ async def hcp_get_job(job_id: str, expand: Optional[str] = None) -> str:
     tags = data.get("tags", [])
     tg = _parse_tags(tags)
     ts = data.get("work_timestamps") or {}
-    schedule = data.get("schedule") or {}
+    sch_start, sch_end, sch_window = _sched(data.get("schedule"))
     employees = data.get("assigned_employees", [])
     customer = data.get("customer") or {}
     address = data.get("address") or {}
 
+    sched_hrs = (_parse_hours(sch_start, sch_end, fallback=-1.0)
+                 if sch_start and sch_end else None)
+    if sched_hrs is not None and sched_hrs < 0:
+        sched_hrs = None
+
+    actual_hrs = (_parse_hours(ts["started_at"], ts["completed_at"], fallback=-1.0)
+                  if ts.get("started_at") and ts.get("completed_at") else None)
+    if actual_hrs is not None and actual_hrs < 0:
+        actual_hrs = None
+
     actual_note = ""
-    if ts.get("started_at") and ts.get("completed_at"):
-        try:
-            start = dt.fromisoformat(ts["started_at"].replace("Z", "+00:00"))
-            end = dt.fromisoformat(ts["completed_at"].replace("Z", "+00:00"))
-            elapsed = (end - start).total_seconds() / 3600
-            actual_note = f" (elapsed start→complete: {elapsed:.1f} hrs — includes any paused time)"
-        except Exception:
-            pass
+    if actual_hrs is not None:
+        # Calendar elapsed, NOT worked hours: on a job spanning several days this
+        # runs first-start to last-complete, overnight gaps included.  Comparing
+        # it to the schedule span is comparing two calendar windows, so say so
+        # and point at the tool that actually models worked time per day.
+        multi_day = (ts.get("started_at", "")[:10]
+                     != ts.get("completed_at", "")[:10])
+        actual_note = (
+            f" (calendar elapsed: {actual_hrs:.1f} hrs"
+            + (" across multiple days — NOT hours worked" if multi_day
+               else " — includes any paused time") + ")"
+        )
+        if multi_day:
+            actual_note += ("\n  For worked tech-hours use "
+                            "hcp_post_job_analysis (per-day model)")
 
     emp_line = ", ".join(
         (e.get("first_name", "") + " " + e.get("last_name", "")).strip()
@@ -463,8 +828,10 @@ async def hcp_get_job(job_id: str, expand: Optional[str] = None) -> str:
         f"Customer: {customer.get('first_name','')} {customer.get('last_name','')}"
         f"  |  Lead source: {data.get('lead_source') or customer.get('lead_source') or '—'}\n"
         f"Address: {address.get('street','')} {address.get('city','')}, {address.get('state','')}\n\n"
-        f"Schedule: {schedule.get('start_time','?')} → {schedule.get('end_time','?')}"
-        f"  |  Window: {schedule.get('arrival_window_minutes','?')} min\n\n"
+        f"Schedule: {sch_start or 'unscheduled'} → {sch_end or '—'}"
+        f"  |  Window: {sch_window if sch_window is not None else '?'} min"
+        + (f"  |  Scheduled span: {sched_hrs:.1f} hrs" if sched_hrs is not None else "")
+        + "\n\n"
         f"Financials:\n"
         f"  Subtotal:    {_dollars(data.get('subtotal'))}\n"
         f"  Total:       {_dollars(data.get('total_amount'))}\n"
@@ -485,8 +852,28 @@ async def hcp_get_job(job_id: str, expand: Optional[str] = None) -> str:
     )
     if data.get("original_estimate_id"):
         summary += f"From estimate: {data['original_estimate_id']}\n"
-    if data.get("recurrence_rule"):
-        summary += f"Recurrence: {data['recurrence_rule']}\n"
+
+    jf = data.get("job_fields") or {}
+    job_type = (jf.get("job_type") or {}).get("name")
+    business_unit = (jf.get("business_unit") or {}).get("name")
+    if job_type or business_unit:
+        summary += f"Job type: {job_type or '—'}  |  Business unit: {business_unit or '—'}\n"
+
+    if data.get("recurrence_rule") or data.get("recurrence_status"):
+        summary += (
+            f"Recurrence: {data.get('recurrence_rule') or '—'}"
+            f"  |  Status: {data.get('recurrence_status') or '—'}"
+            f"  |  Occurrence #{data.get('recurrence_number') or '?'}"
+            f"  |  Series: {data.get('recurrence_id') or '—'}\n"
+        )
+    if data.get("assigned_route_template_id"):
+        summary += f"Route template: {data['assigned_route_template_id']}\n"
+    if data.get("locked_at"):
+        summary += f"Locked at: {data['locked_at']}\n"
+    if data.get("canceled_at"):
+        summary += f"Canceled (by customer): {data['canceled_at']}\n"
+    if data.get("deleted_at"):
+        summary += f"Canceled (by pro): {data['deleted_at']}\n"
     return summary
 
 
@@ -575,6 +962,7 @@ async def hcp_get_job_invoice(job_id: str) -> str:
             lines.append(
                 f"  • {i.get('name','')} [{i.get('type','')}]"
                 f"  qty: {qty}  @ {_dollars(i.get('unit_price'))} = {_dollars(i.get('amount'))}"
+                + _invoiced_note(i)
             )
 
     if taxes := inv.get("taxes", []):
@@ -813,6 +1201,7 @@ async def hcp_get_invoice(invoice_uuid: str) -> str:
             lines.append(
                 f"  • {i.get('name','')}  qty: {qty}"
                 f"  @ {_dollars(i.get('unit_price'))} = {_dollars(i.get('amount'))}"
+                + _invoiced_note(i)
             )
     if taxes := inv.get("taxes", []):
         lines.append("\nTaxes:")
@@ -906,9 +1295,10 @@ async def hcp_get_estimate(estimate_id: str) -> str:
     data = await api_request("GET", f"/estimates/{estimate_id}")
     customer  = data.get("customer") or {}
     address   = data.get("address") or {}
-    schedule  = data.get("schedule") or {}
+    sch_start, sch_end, _ = _sched(data.get("schedule"))
     employees = data.get("assigned_employees", [])
     options   = data.get("options", [])
+    ef        = data.get("estimate_fields") or {}
 
     emp_line = ", ".join(
         (e.get("first_name", "") + " " + e.get("last_name", "")).strip()
@@ -924,10 +1314,14 @@ async def hcp_get_estimate(estimate_id: str) -> str:
         f"  Lead source: {data.get('lead_source') or customer.get('lead_source') or '—'}",
         f"Address: {address.get('street','')} {address.get('city','')}, {address.get('state','')} {address.get('zip','')}",
         f"Assigned: {emp_line}",
-        f"Scheduled: {schedule.get('start_time','—')} → {schedule.get('end_time','—')}",
+        f"Scheduled: {sch_start or '—'} → {sch_end or '—'}",
+        f"Job type: {(ef.get('job_type') or {}).get('name') or '—'}"
+        f"  |  Business unit: {(ef.get('business_unit') or {}).get('name') or '—'}",
         f"Created: {data.get('created_at','?')}",
-        f"\n{len(options)} option(s):",
     ]
+    if data.get("assigned_route_template_id"):
+        lines.append(f"Route template: {data['assigned_route_template_id']}")
+    lines.append(f"\n{len(options)} option(s):")
     for opt in options:
         tags_str  = ", ".join(opt.get("tags") or []) or "—"
         notes_str = f"  ({len(opt.get('notes') or [])} note(s))"
@@ -976,7 +1370,7 @@ async def hcp_get_estimate_brief(estimate_id: str) -> str:
     # ── Customer & property ────────────────────────────────────────────────────
     customer = est_data.get("customer") or {}
     address  = est_data.get("address") or {}
-    schedule = est_data.get("schedule") or {}
+    sch_start, sch_end, _ = _sched(est_data.get("schedule"))
 
     phone = (customer.get("mobile_number") or customer.get("home_number")
              or customer.get("work_number") or "—")
@@ -1006,10 +1400,10 @@ async def hcp_get_estimate_brief(estimate_id: str) -> str:
     ]
 
     # Appointment window (if scheduled)
-    if schedule.get("start_time"):
+    if sch_start:
         lines.append(
-            f"║  Appointment: {schedule['start_time'][:16].replace('T',' ')} "
-            f"→ {(schedule.get('end_time') or '')[:16].replace('T',' ')}"
+            f"║  Appointment: {sch_start[:16].replace('T',' ')} "
+            f"→ {(sch_end or '')[:16].replace('T',' ')}"
         )
 
     # Customer-level notes from the full customer record
@@ -2799,11 +3193,11 @@ async def hcp_pipeline_board(
             if e.get("id") in _ACTIVE_TECH_IDS
         ) or "Unassigned"
         loc = f"  [{city}]" if city else ""
-        sched = job.get("schedule") or {}
+        sched_start, _, _ = _sched(job.get("schedule"))
         appt_str = ""
-        if sched.get("start_time"):
+        if sched_start:
             try:
-                appt_dt = dt.fromisoformat(sched["start_time"].replace("Z", "+00:00"))
+                appt_dt = dt.fromisoformat(sched_start.replace("Z", "+00:00"))
                 appt_str = f"  📅 {appt_dt.strftime('%b %d')}"
             except Exception:
                 pass
@@ -2827,8 +3221,7 @@ async def hcp_pipeline_board(
             # Sort in_progress and scheduled by appointment date asc
             elif bucket_key in ("in_progress", "scheduled"):
                 def _appt_sort(j: dict) -> str:
-                    s = (j.get("schedule") or {}).get("start_time") or "9999"
-                    return s
+                    return _sched(j.get("schedule"))[0] or "9999"
                 jobs_here = sorted(jobs_here, key=_appt_sort)
             for job in jobs_here:
                 lines.append(_render_job(job))
@@ -2892,8 +3285,12 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     Pulls in parallel: job detail, line items, invoice, appointments, input materials.
 
     Calculates:
-      • Quoted hours vs scheduled tech-hours (best available proxy for actual)
-      • Labor cost using blended rate from lhstl_config.json
+      • Quoted vs scheduled vs actual tech-hours, with variances.
+        Actual comes from work_timestamps (started_at → completed_at) × crew size.
+        HCP's public API has no per-tech tracking and no pause data, so this is
+        elapsed time on site; multi-visit jobs are flagged as unreliable.
+      • Labor cost using blended rate from lhstl_config.json, costed on actual
+        hours when trustworthy and scheduled hours otherwise
       • Materials cost from line item unit_costs (what LHSTL paid)
       • Gross profit and margin %
       • Add-on revenue (line items with 'add on' / 'addon' in name)
@@ -2910,30 +3307,39 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     sched_cfg   = cfg.get("scheduling", {})
     cost_rate   = float(sched_cfg.get("blended_cost_per_tech_hour", 95.0))
 
-    # ── Parallel fetch job data, line items, invoice, materials ──────────────
-    job_data, li_data, inv_data, mat_data = await asyncio.gather(
-        api_request("GET", f"/jobs/{job_id}"),
-        api_request("GET", f"/jobs/{job_id}/line_items"),
-        api_request("GET", f"/jobs/{job_id}/invoices"),
-        api_request("GET", f"/jobs/{job_id}/job_input_materials"),
-        return_exceptions=True,
-    )
+    # ── Parallel fetch job data, line items, invoice, materials, appointments ──
+    # All through _get_json so a rate-limit retries instead of silently becoming
+    # an empty payload (which used to read as "0 quoted hours, no appointments").
+    async with _hcp_client() as client:
+        results = await asyncio.gather(
+            _get_json(client, f"/jobs/{job_id}"),
+            _get_json(client, f"/jobs/{job_id}/line_items"),
+            _get_json(client, f"/jobs/{job_id}/invoices"),
+            _get_json(client, f"/jobs/{job_id}/job_input_materials"),
+            _get_json(client, f"/jobs/{job_id}/appointments"),
+        )
+    (job_data, job_err), (li_data, li_err), (inv_data, inv_err), \
+        (mat_data, mat_err), (appt_data, appt_err) = results
 
-    def _safe(result, default):
-        return default if isinstance(result, Exception) else result
+    if job_err:
+        return (f"❌ Could not load job {job_id}: {job_err}\n"
+                f"   If this is 'HTTP 429' the API is rate-limiting — retry shortly.")
 
-    job_data = _safe(job_data, {})
-    li_data  = _safe(li_data,  {})
-    inv_data = _safe(inv_data, {})
-    mat_data = _safe(mat_data, {})
+    # Canceled jobs are archived; /appointments 400s permanently on them.
+    if appt_err == "HTTP 400":
+        appt_data, appt_err = {}, None
 
-    # Fetch appointments via _hcp_client — embeds assigned_employees objects
-    # (api_request does not embed them; same pattern as hcp_get_job_appointments)
-    try:
-        async with _hcp_client() as client:
-            appt_data = await _get(client, f"/jobs/{job_id}/appointments", {})
-    except Exception:
-        appt_data = {}
+    fetch_warnings = [
+        f"{label} unavailable ({err})"
+        for label, err in (("line items", li_err), ("invoice", inv_err),
+                           ("input materials", mat_err), ("appointments", appt_err))
+        if err
+    ]
+    job_data = job_data or {}
+    li_data  = li_data or {}
+    inv_data = inv_data or {}
+    mat_data = mat_data or {}
+    appt_data = appt_data or {}
 
     # ── Job header ────────────────────────────────────────────────────────────
     customer   = job_data.get("customer") or {}
@@ -3011,35 +3417,21 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     if not isinstance(appts, list):
         appts = []
 
-    total_tech_hours = 0.0
-    appt_lines       = []
-    for appt in appts:
-        start_str = appt.get("start_time") or appt.get("scheduled_start") or ""
-        end_str   = appt.get("end_time")   or appt.get("scheduled_end")   or ""
+    # ── Scheduled + actual, both from the per-day model ───────────────────────
+    # See _estimate_job_time.  HCP gives one job-level started_at/completed_at
+    # pair, so a multi-day job is built day by day from its appointments with
+    # only the outer edges anchored to those timestamps.
+    _tm  = _time_model(cfg)
+    _est = _estimate_job_time(job_data, appts, items, _tm)
 
-        # assigned_employees — list of employee objects (available when fetched via _hcp_client)
-        emp_objs = appt.get("assigned_employees") or []
-        if isinstance(emp_objs, list) and emp_objs and isinstance(emp_objs[0], dict):
-            n_techs    = len(emp_objs)
-            tech_names = ", ".join(
-                (e.get("first_name","") + " " + e.get("last_name","")).strip()
-                for e in emp_objs
-            ) or f"{n_techs} tech(s)"
-        else:
-            # Fallback: count dispatched employee IDs if objects aren't embedded
-            emp_ids    = appt.get("dispatched_employees_ids") or []
-            n_techs    = len(emp_ids)
-            tech_names = f"{n_techs} tech(s)" if n_techs > 0 else "—"
-
-        # Use existing _parse_hours helper — handles Z suffix correctly
-        appt_hrs = _parse_hours(start_str, end_str, fallback=0.0)
-
-        tech_hrs = appt_hrs * n_techs
-        total_tech_hours += tech_hrs
-        date_str = start_str[:10] if start_str else "?"
-        appt_lines.append(
-            f"    {date_str}  {n_techs} tech(s) × {appt_hrs:.1f}h = {tech_hrs:.1f} tech-hrs  [{tech_names}]"
-        )
+    actual_tech_hours = _est["actual"] or 0.0
+    has_actual        = _est["grade"] in ("measured", "estimated")
+    # None when no per-day skeleton exists — a multi-day job.schedule span times
+    # crew would be a fabricated number (one such job spans 89 days), so leave it
+    # unknown rather than inventing it.
+    total_tech_hours  = _est["scheduled"]
+    sched_known       = total_tech_hours is not None
+    sched_hours       = total_tech_hours or 0.0
 
     # ── Input materials (if logged) ───────────────────────────────────────────
     input_mats = mat_data.get("job_input_materials") or mat_data.get("data") or []
@@ -3047,7 +3439,14 @@ async def hcp_post_job_analysis(job_id: str) -> str:
         input_mats = []
 
     # ── Cost & margin ─────────────────────────────────────────────────────────
-    labor_cost   = total_tech_hours * cost_rate
+    # Cost on real worked time when the day model measured it; otherwise the
+    # schedule is the only defensible basis.
+    costed_hours = actual_tech_hours if has_actual else sched_hours
+    costed_basis = {
+        "measured":  "measured actual time",
+        "estimated": f"estimated actual ({_est['coverage']*100:.0f}% anchored)",
+    }.get(_est["grade"], "scheduled time")
+    labor_cost   = costed_hours * cost_rate
     # Use input material costs if logged, otherwise fall back to line item unit_costs
     if input_mats:
         mat_cost = sum(
@@ -3065,7 +3464,7 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     is_warranty  = "JOB-WARRANTY" in tags_upper
     has_addons   = len(addons) > 0
     has_discount = inv_discount > 0
-    hour_variance = total_tech_hours - quoted_hrs  # + = over, - = under
+    hour_variance = sched_hours - quoted_hrs  # + = over, - = under
 
     # ── Format output ─────────────────────────────────────────────────────────
     lines = [
@@ -3079,6 +3478,8 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     ]
     if is_warranty:
         lines.append(f"║  ⚠ WARRANTY JOB — JOB-WARRANTY tag present")
+    for w in fetch_warnings:
+        lines.append(f"║  ⚠ INCOMPLETE DATA — {w}; figures below understate.")
 
     # ── Time ──────────────────────────────────────────────────────────────────
     lines += [
@@ -3086,13 +3487,52 @@ async def hcp_post_job_analysis(job_id: str) -> str:
         f"║  Quoted hours:          {quoted_hrs:.1f} hrs",
         f"║    Base scope:          {base_hrs:.1f} hrs",
         f"║    Add-ons:             {addon_hrs:.1f} hrs",
-        f"║  Scheduled tech-hours:  {total_tech_hours:.1f} hrs  (across {len(appts)} appointment(s))",
-        f"║  Hour variance:         {hour_variance:+.1f} hrs  ({'over' if hour_variance > 0 else 'under'} quoted)",
+        f"║  Scheduled tech-hours:  "
+        + (f"{sched_hours:.1f} hrs  (across {_est['ndays']} work day(s))"
+           if sched_known else "— (no per-day record)"),
     ]
-    if appt_lines:
+    _GRADE_NOTE = {
+        "measured":  "single day, both edges timestamp-anchored — trustworthy",
+        "estimated": "multi-day: outer edges anchored, middle days from schedule",
+        "scheduled": "timestamps unusable — this is the schedule, not a measurement",
+        "unmeasurable": "no per-day record exists",
+    }
+    if has_actual:
+        lines += [
+            f"║  Actual tech-hours:     {actual_tech_hours:.1f} hrs"
+            f"  over {_est['ndays']} work day(s)",
+            f"║  Actual vs quoted:      {actual_tech_hours - quoted_hrs:+.1f} hrs",
+            f"║  Actual vs scheduled:   {actual_tech_hours - sched_hours:+.1f} hrs",
+        ]
+    else:
+        lines.append(f"║  Actual tech-hours:     — not measurable")
+    lines.append(
+        f"║  Confidence:            {_est['grade'].upper()}"
+        f"  ({_est['coverage']*100:.0f}% of day boundaries anchored)"
+    )
+    lines.append(f"║    {_GRADE_NOTE.get(_est['grade'], '')}")
+    for f in _est["flags"]:
+        lines.append(f"║  ⚠ {f}")
+    if started_at and completed_at:
+        lines.append(
+            f"║  Timestamps:            {started_at[:16].replace('T', ' ')}"
+            f" → {completed_at[:16].replace('T', ' ')}"
+        )
+    lines.append(
+        f"║  Scheduled vs quoted:   {hour_variance:+.1f} hrs"
+        f"  ({'over' if hour_variance > 0 else 'under'} quoted)"
+    )
+    if _est["day_lines"]:
         lines.append(f"║")
-        lines.append(f"║  Appointment breakdown:")
-        lines += appt_lines
+        lines.append(f"║  Day breakdown ({_est['source']}):")
+        lines += _est["day_lines"]
+    lines.append(f"║")
+    lines.append(
+        f"║  ℹ Day hours are the booked window less a {_tm['lunch']*60:.0f}-min break,"
+    )
+    lines.append(
+        f"║    × crew.  HCP exposes no per-tech tracking and no pause data."
+    )
 
     # ── Revenue ───────────────────────────────────────────────────────────────
     lines += [
@@ -3121,7 +3561,8 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     # ── Cost & margin ─────────────────────────────────────────────────────────
     lines += [
         f"╠══ COST & MARGIN ═════════════════════════════════════════════",
-        f"║  Labor cost:            ${labor_cost:,.2f}  ({total_tech_hours:.1f} tech-hrs × ${cost_rate:.0f}/hr)",
+        f"║  Labor cost:            ${labor_cost:,.2f}"
+        f"  ({costed_hours:.1f} tech-hrs × ${cost_rate:.0f}/hr, from {costed_basis})",
         f"║  Materials cost:        ${mat_cost:,.2f}" + ("  (from input materials log)" if input_mats else "  (from line item unit costs)"),
         f"║  Total cost:            ${total_cost:,.2f}",
         f"║  ─────────────────────────────────────────────────────────",
@@ -3171,6 +3612,277 @@ async def hcp_post_job_analysis(job_id: str) -> str:
         lines.append(f"║  (none logged — materials cost from line item unit costs)")
 
     lines.append(f"╚{'═'*61}")
+    return "\n".join(lines)
+
+
+# ── Scheduled vs actual time across a date range ───────────────────────────────
+
+@mcp.tool()
+async def hcp_time_variance(
+    start_date: str,
+    end_date: str,
+    max_jobs: Optional[int] = 200,
+    only_completed: Optional[bool] = True,
+    show_clusters: Optional[bool] = True,
+) -> str:
+    """
+    Compare quoted vs scheduled vs actual tech-hours for jobs in a date range.
+
+    Built for the post-week review.  Every job gets a confidence grade instead of
+    being silently dropped, so multi-day work is analysed rather than discarded:
+
+      • Quoted    — sum of quantity on labor line items
+      • Scheduled — appointment windows × techs dispatched, less the unpaid break
+      • Actual    — per-DAY model: each appointment day contributes its window,
+                    with day 1's start and the final day's end replaced by the
+                    real started_at / completed_at when those are trustworthy
+
+    Grades:
+      MEASURED     single day, both edges backed by real timestamps — trust these
+      ESTIMATED    multi-day, outer edges anchored, middle days from the schedule
+      SCHEDULED    timestamps unusable (stale start / late closeout) — 'actual'
+                   here is just the schedule and carries no information
+      UNMEASURABLE multi-day job.schedule with no appointment records, so there
+                   is no way to know which days were worked
+
+    HCP exposes no per-tech tracking and no pause data, so a day's hours are the
+    window × crew size less the break; on-site downtime is included.
+
+    Args:
+        start_date: First day to include, YYYY-MM-DD
+        end_date: Last day to include, YYYY-MM-DD
+        max_jobs: Cap on jobs analyzed (default 200).  Pages through results;
+                  any overflow is reported rather than silently dropped.
+        only_completed: Skip jobs that never reached a completed status (default True)
+        show_clusters: Roll up jobs that are one project split across records
+    """
+    cfg       = _load_config()
+    tm        = _time_model(cfg)
+    cost_rate = float(cfg.get("scheduling", {}).get("blended_cost_per_tech_hour", 95.0))
+    limit     = _as_int(max_jobs, 200)
+
+    # ── page through the range instead of taking one page and truncating ──────
+    jobs: list[dict] = []
+    total_in_range = None
+    page = 1
+    while len(jobs) < limit:
+        data = await api_request("GET", "/jobs", params={
+            "scheduled_start_min": f"{start_date}T00:00:00Z",
+            "scheduled_start_max": f"{end_date}T23:59:59Z",
+            "page": page,
+            "page_size": 100,
+            "sort_by": "created_at",
+            "sort_direction": "desc",
+        })
+        batch = data.get("jobs", [])
+        if total_in_range is None:
+            total_in_range = data.get("total_items") or data.get("total_count")
+        jobs += batch
+        pages = data.get("total_pages") or data.get("total_pages_count") or 1
+        if page >= pages or not batch:
+            break
+        page += 1
+
+    fetched_all = total_in_range is None or len(jobs) >= (total_in_range or 0)
+    if only_completed:
+        jobs = [j for j in jobs
+                if _norm_status(j.get("work_status", "")).startswith("complete")]
+    truncated = len(jobs) > limit
+    jobs = jobs[:limit]
+
+    if not jobs:
+        return (
+            f"No {'completed ' if only_completed else ''}jobs scheduled between "
+            f"{start_date} and {end_date}.\n"
+            f"Try only_completed=False, or widen the date range."
+        )
+
+    # ── fetch line items + appointments per job (throttled, retried) ──────────
+    async with _hcp_client() as client:
+        fetched = await _fanout_jobs(client, jobs, ["/line_items", "/appointments"])
+
+    rows: list[dict] = []
+    fetch_failed: list[tuple[str, str]] = []
+    for job, ((li_data, li_err), (appt_data, appt_err)) in zip(jobs, fetched):
+        # Canceled jobs are archived and their /appointments 400s permanently
+        # ("Archived job").  That is a real state, not a fetch failure.
+        if appt_err == "HTTP 400":
+            appt_data, appt_err = {}, None
+        # A rate-limited fetch must not masquerade as "no line items" — that
+        # would report 0 quoted hours as though the job were genuinely unquoted.
+        if li_err or appt_err:
+            fetch_failed.append((str(job.get("invoice_number", "?")),
+                                 li_err or appt_err or "?"))
+            continue
+
+        items = (li_data or {}).get("data") or (li_data or {}).get("line_items") or []
+        appts = (appt_data or {}).get("appointments") or []
+        if not isinstance(appts, list):
+            appts = []
+
+        est = _estimate_job_time(job, appts, items, tm)
+        customer = job.get("customer") or {}
+        est.update({
+            "num":  job.get("invoice_number", "?"),
+            "name": f"{customer.get('first_name','')} {customer.get('last_name','')}".strip()
+                    or (job.get("description") or "")[:20],
+            "revenue": _as_int(job.get("total_amount"), 0),
+            "job": job,
+        })
+        rows.append(est)
+
+    by_grade: dict[str, list[dict]] = {}
+    for r in rows:
+        by_grade.setdefault(r["grade"], []).append(r)
+
+    measured  = by_grade.get("measured", [])
+    estimated = by_grade.get("estimated", [])
+    no_signal = by_grade.get("scheduled", []) + by_grade.get("unmeasurable", [])
+
+    lines = [
+        f"╔══ TIME VARIANCE — {start_date} to {end_date} ══════════════════",
+        f"║  {len(rows)} job(s) analyzed"
+        f"  |  {len(measured)} measured, {len(estimated)} estimated,"
+        f" {len(no_signal)} no actual signal",
+    ]
+    if truncated or not fetched_all:
+        lines.append(
+            f"║  ⚠ Capped at max_jobs={limit}"
+            f"{f' of {total_in_range} in range' if total_in_range else ''}"
+            f" — raise max_jobs for the full picture."
+        )
+    if fetch_failed:
+        lines.append(
+            f"║  ⚠ {len(fetch_failed)} job(s) EXCLUDED — data fetch failed "
+            f"(rate limit or API error), NOT counted below:"
+        )
+        lines.append(
+            f"║    {', '.join(f'#{n} ({e})' for n, e in fetch_failed[:10])}"
+            + ("  …" if len(fetch_failed) > 10 else "")
+        )
+        lines.append(f"║    Re-run to pick these up.")
+
+    def _table(title: str, group: list[dict], note: str = "") -> None:
+        if not group:
+            return
+        lines.append(f"╠══ {title} ═══════════════════════════════════════")
+        if note:
+            lines.append(f"║  {note}")
+        lines.append(
+            f"║  {'Job':<7}{'Customer':<19}{'Quot':>6}{'Sched':>7}{'Act':>7}"
+            f"{'v.Quot':>8}{'Cov':>6}"
+        )
+        for r in sorted(group, key=lambda r: (r["actual"] or 0) - r["quoted"],
+                        reverse=True):
+            lines.append(
+                f"║  #{str(r['num']):<6}{r['name'][:18]:<19}"
+                f"{r['quoted']:>6.1f}{r['scheduled'] or 0:>7.1f}{r['actual'] or 0:>7.1f}"
+                f"{(r['actual'] or 0) - r['quoted']:>+8.1f}{r['coverage']*100:>5.0f}%"
+            )
+            if r["flags"]:
+                lines.append(f"║      ⚠ {', '.join(r['flags'])}")
+
+    _table("MEASURED — trust these", measured,
+           "Single-day jobs with both edges timestamp-anchored.")
+    _table("ESTIMATED — edges anchored, middle days inferred", estimated,
+           "Multi-day.  Cov% = share of day boundaries backed by a real timestamp.")
+
+    # ── totals ───────────────────────────────────────────────────────────────
+    def _totals(title: str, group: list[dict], inferred: bool = False) -> None:
+        if not group:
+            return
+        tq  = sum(r["quoted"] for r in group)
+        tsc = sum(r["scheduled"] or 0 for r in group)
+        ta  = sum(r["actual"] or 0 for r in group)
+        over = [r for r in group if (r["actual"] or 0) > r["quoted"]]
+        lines.extend([
+            f"╠══ {title} ({len(group)} jobs) ══════════════════════════",
+            f"║  Quoted:     {tq:>7.1f} tech-hrs",
+            f"║  Scheduled:  {tsc:>7.1f} tech-hrs  ({tsc - tq:+.1f} vs quoted)",
+            f"║  Actual:     {ta:>7.1f} tech-hrs  ({ta - tq:+.1f} vs quoted,"
+            f" {ta - tsc:+.1f} vs scheduled)",
+            f"║  Jobs over quote:  {len(over)} of {len(group)}"
+            f"  ({len(over) / len(group) * 100:.0f}%)",
+        ])
+        if tq > 0:
+            lines.append(
+                f"║  Quote accuracy:   {ta / tq * 100:.0f}% of quoted hours used"
+            )
+        if ta > tq:
+            label = ("Overrun vs quote" if inferred else "Unbilled overrun")
+            lines.append(
+                f"║  {label}:  ${(ta - tq) * cost_rate:,.2f}"
+                f"  ({ta - tq:.1f} hrs × ${cost_rate:.0f}/hr)"
+            )
+        if tsc > ta:
+            lines.append(
+                f"║  Calendar slack:   {tsc - ta:.1f} tech-hrs blocked but not worked"
+                f"  (${(tsc - ta) * cost_rate:,.2f} of capacity)"
+            )
+        if inferred:
+            lines.append(
+                f"║  ⚠ Multi-day 'actual' is mostly schedule-derived, so this block"
+            )
+            lines.append(
+                f"║    measures calendar blocking as much as time actually worked."
+            )
+            lines.append(
+                f"║    Use the MEASURED-ONLY block above to judge quote accuracy."
+            )
+
+    _totals("TOTALS — MEASURED ONLY", measured)
+    if estimated:
+        _totals("TOTALS — MEASURED + ESTIMATED", measured + estimated, inferred=True)
+
+    # ── split projects ───────────────────────────────────────────────────────
+    if show_clusters:
+        by_id = {r["job"]["id"]: r for r in rows}
+        groups = _cluster_jobs([r["job"] for r in rows], tm)
+        if groups:
+            lines.append(
+                f"╠══ SPLIT PROJECTS ({len(groups)}) ═══════════════════════════════"
+            )
+            lines.append(
+                f"║  Same customer + address within {tm['cluster_gap']} days — "
+                f"likely one job across several records."
+            )
+            for grp in groups:
+                members = [by_id[j["id"]] for j in grp if j["id"] in by_id]
+                if not members:
+                    continue
+                nums = "+".join(f"#{m['num']}" for m in members)
+                tq = sum(m["quoted"] for m in members)
+                tsc = sum(m["scheduled"] or 0 for m in members)
+                ta = sum(m["actual"] or 0 for m in members)
+                rev = sum(m["revenue"] for m in members)
+                lines.append(
+                    f"║  {members[0]['name'][:18]:<19}{nums:<18}"
+                    f" quoted {tq:6.1f}  sched {tsc:6.1f}  act {ta:6.1f}"
+                    f"  rev {_dollars(rev)}"
+                )
+
+    # ── the actionable data-hygiene list ─────────────────────────────────────
+    if no_signal:
+        lines.append(
+            f"╠══ NO ACTUAL SIGNAL ({len(no_signal)}) ══════════════════════════════"
+        )
+        lines.append(f"║  Fix these in HCP and they become measurable:")
+        reasons: dict[str, list[str]] = {}
+        for r in no_signal:
+            why = ", ".join(r["flags"]) or "timestamps unusable"
+            reasons.setdefault(why, []).append(f"#{r['num']}")
+        for why, nums in sorted(reasons.items(), key=lambda kv: -len(kv[1])):
+            lines.append(f"║  {len(nums):3d} × {why}")
+            lines.append(f"║        {', '.join(nums[:18])}"
+                         + ("  …" if len(nums) > 18 else ""))
+
+    lines += [
+        f"╠══════════════════════════════════════════════════════════════",
+        f"║  ℹ Actual = per-day windows × crew, less a {tm['lunch']*60:.0f}-min break,",
+        f"║    with day 1 start and final day end anchored to real timestamps.",
+        f"║    Middle days of a multi-day job are inference — no data exists.",
+        f"╚{'═'*61}",
+    ]
     return "\n".join(lines)
 
 

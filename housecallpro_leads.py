@@ -26,6 +26,13 @@ async def get_leads(
     """
     List leads with optional filters.
 
+    Each lead includes:
+        total_amount: Lead value in CENTS (divide by 100 to display as dollars)
+        conversions:  List of {type, id} for jobs/estimates this lead became.
+                      Empty until the lead is converted. type is "Job" or "Estimate".
+        job_fields:   {job_type_uuid, business_unit_uuid} assigned to the lead
+        pipeline_status: Current pipeline stage name (e.g. "New Lead")
+
     Args:
         page: Page number (default 1)
         page_size: Results per page (default 50, max 200)
@@ -53,6 +60,10 @@ async def get_leads(
 async def get_lead(lead_id: str) -> Dict[str, Any]:
     """
     Get a specific lead by ID.
+
+    Includes total_amount (in CENTS), conversions (list of {type, id} for the
+    jobs/estimates this lead became — empty until converted), and job_fields
+    ({job_type_uuid, business_unit_uuid}).
 
     Args:
         lead_id: Lead UUID
