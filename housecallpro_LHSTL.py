@@ -1736,7 +1736,7 @@ async def hcp_upload_estimate_pdf(
         estimate_id: Estimate UUID
         option_id:   Estimate option UUID
         file_path:   Absolute path to the file on this machine
-                     (e.g. /Users/nikki_zav/Documents/estimates/kokoski_scope.pdf)
+                     (e.g. ~/Documents/estimates/scope.pdf, expanded to a full path)
     """
     from pathlib import Path as _Path
     import mimetypes
