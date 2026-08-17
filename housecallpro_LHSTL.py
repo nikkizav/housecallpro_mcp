@@ -14,6 +14,7 @@ that file — no code changes required here.
 
 import asyncio
 import json
+import os
 import re
 import time
 from datetime import date, timedelta, datetime as dt
@@ -28,15 +29,61 @@ mcp = FastMCP("Housecall Pro LHSTL")
 
 # ── Load company config ────────────────────────────────────────────────────────
 
-_CONFIG_PATH = Path(__file__).parent.parent / "lhstl_config.json"
+_HERE = Path(__file__).parent
+
+# Candidates in priority order.  config.json beside this file is the documented
+# location; the parent-directory name is kept so existing installs keep working.
+_CONFIG_CANDIDATES = (
+    _HERE / "config.json",
+    _HERE / "lhstl_config.json",
+    _HERE.parent / "lhstl_config.json",
+)
+
+
+def _resolve_config_path() -> Path:
+    """Find the company config.  HCP_CONFIG_PATH overrides everything."""
+    override = os.environ.get("HCP_CONFIG_PATH")
+    if override:
+        return Path(override).expanduser()
+    for candidate in _CONFIG_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return _CONFIG_CANDIDATES[0]
+
+
+_CONFIG_PATH = _resolve_config_path()
+
 
 def _load_config() -> dict:
-    """Load lhstl_config.json.  Falls back to safe hardcoded defaults if missing."""
+    """Load the company config, or {} when it is missing or malformed.
+
+    Missing config is not fatal — the read-only tools still work — but the
+    capacity, pipeline and costing tools need it.  `hcp_check_setup` reports
+    the state rather than letting it fail silently, which is how a fresh clone
+    used to end up running with 0 techs and no labor rate.
+    """
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _config_state() -> tuple[bool, str]:
+    """(ok, human-readable reason) for the config file itself."""
+    if not _CONFIG_PATH.exists():
+        return False, f"no config file found (looked for {_CONFIG_PATH.name})"
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            json.load(f)
+    except json.JSONDecodeError as e:
+        return False, f"config is not valid JSON: {e}"
+    except OSError as e:
+        return False, f"config unreadable: {e}"
+    return True, "ok"
+
 
 _CFG = _load_config()
 
@@ -57,11 +104,12 @@ def _build_tech_sets(cfg: dict) -> tuple[frozenset, set]:
 
 _ACTIVE_TECH_IDS, _HALF_TIME_IDS = _build_tech_sets(_CFG)
 
-# Apprentice / half-time ID (used in tools that need to identify Ryan specifically)
-_RYAN_ID = next(
-    (m["hcp_id"] for m in _CFG.get("team", [])
-     if m.get("role") == "apprentice" and m.get("hcp_id")),
-    "pro_3dc62cf7dcba426d9e5701704753da70",  # fallback
+# Half-time / apprentice employee IDs, from config only.  There is deliberately
+# no hardcoded fallback: an ID from another company's account would silently
+# mis-weight this account's capacity math.
+_APPRENTICE_IDS = frozenset(
+    m["hcp_id"] for m in _CFG.get("team", [])
+    if m.get("role") == "apprentice" and m.get("hcp_id")
 )
 
 # Scheduling constants
@@ -2123,7 +2171,8 @@ async def hcp_get_week_schedule(
         if m.get("field_tech") and m.get("capacity_multiplier", 1.0) >= 1.0
     ) or 5)
     hrs_per_day = float(hours_per_day) if hours_per_day else _HRS_PER_DAY
-    ht_ids = set(_as_list(half_time_employee_ids) or []) or set(_HALF_TIME_IDS) or {_RYAN_ID}
+    ht_ids = (set(_as_list(half_time_employee_ids) or [])
+              or set(_HALF_TIME_IDS) or set(_APPRENTICE_IDS))
 
     # ── Parallel API fetches ─────────────────────────────────────────────────────
     # Two job queries are needed:
@@ -2638,7 +2687,7 @@ async def hcp_multi_week_view(
         for e in employees
         if e["id"] in _ACTIVE_TECH_IDS
     }
-    ht_ids   = set(_HALF_TIME_IDS) or {_RYAN_ID}
+    ht_ids   = set(_HALF_TIME_IDS) or set(_APPRENTICE_IDS)
     ft_count = sum(1 for eid in _ACTIVE_TECH_IDS if eid not in ht_ids)
 
     # Flatten + dedup; keep scheduled + in_progress
@@ -3883,6 +3932,142 @@ async def hcp_time_variance(
         f"║    Middle days of a multi-day job are inference — no data exists.",
         f"╚{'═'*61}",
     ]
+    return "\n".join(lines)
+
+
+# ── Setup diagnostics ──────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def hcp_check_setup() -> str:
+    """
+    Verify this install: API key, config file, and whether the configured IDs
+    actually exist in THIS Housecall Pro account.
+
+    Run this first after installing, and any time a tool returns empty or
+    obviously wrong numbers.  Employee and pipeline-stage IDs are unique per HCP
+    account, so a config copied from another company will look valid but match
+    nothing here — this tool catches exactly that.
+    """
+    lines = ["╔══ SETUP CHECK ═══════════════════════════════════════════════"]
+    problems: list[str] = []
+    advice: list[str] = []
+
+    # ── 1. API key + connectivity ────────────────────────────────────────────
+    company_name = None
+    try:
+        async with _hcp_client() as client:
+            data, err = await _get_json(client, "/company")
+        if err:
+            problems.append(f"API call failed: {err}")
+            lines.append(f"║  ✗ API key / connectivity — {err}")
+            if "401" in err or "403" in err:
+                advice.append("Check HOUSECALL_PRO_API_KEY. Housecall Pro > "
+                              "Settings > Integrations > API (needs the MAX plan).")
+            elif "429" in err:
+                advice.append("Rate limited right now — wait a minute and re-run.")
+        else:
+            company_name = (data or {}).get("name") or (data or {}).get("company_name")
+            lines.append(f"║  ✓ API key works — connected to: {company_name or 'unknown company'}")
+    except Exception as e:
+        problems.append(f"API unreachable: {type(e).__name__}")
+        lines.append(f"║  ✗ API unreachable — {type(e).__name__}: {e}")
+
+    # ── 2. config file ───────────────────────────────────────────────────────
+    cfg_ok, cfg_why = _config_state()
+    if cfg_ok:
+        lines.append(f"║  ✓ Config found — {_CONFIG_PATH}")
+    else:
+        problems.append(cfg_why)
+        lines.append(f"║  ✗ Config — {cfg_why}")
+        lines.append(f"║      searched: {', '.join(str(p) for p in _CONFIG_CANDIDATES)}")
+        advice.append("Run:  uv run python setup_wizard.py    "
+                      "(discovers your team + pipeline IDs and writes config.json)")
+
+    cfg = _load_config()
+    company_cfg = (cfg.get("company") or {}).get("name")
+    if company_cfg:
+        lines.append(f"║    Configured company: {company_cfg}")
+        # Compare on letters and digits only: "Local Handyman St. Louis" and
+        # "Local Handyman - St. Louis" are the same company.
+        def _squash(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", s.lower())
+        a, b = _squash(company_cfg), _squash(company_name or "")
+        if b and a and a not in b and b not in a:
+            lines.append(f"║  ⚠ Config says '{company_cfg}' but the API key belongs to "
+                         f"'{company_name}'.")
+            advice.append("This config may have been copied from another account — "
+                          "re-run setup_wizard.py to rebuild it for this one.")
+
+    # ── 3. scheduling constants ──────────────────────────────────────────────
+    sched = cfg.get("scheduling") or {}
+    rate = sched.get("blended_cost_per_tech_hour")
+    if rate is None:
+        lines.append("║  ⚠ No blended_cost_per_tech_hour — margin math falls back to $95/hr")
+        advice.append("Set scheduling.blended_cost_per_tech_hour to YOUR fully-loaded "
+                      "cost per tech-hour; $95 is another company's number.")
+    else:
+        lines.append(f"║  ✓ Labor cost rate: ${float(rate):,.2f}/tech-hour")
+    lines.append(
+        f"║    Day model: {sched.get('appointment_window_hours', 8.5)}h booked window, "
+        f"{sched.get('productive_hours_per_day', 8.0)}h productive"
+    )
+
+    # ── 4. team IDs vs the live account ──────────────────────────────────────
+    team = [m for m in cfg.get("team", []) if m.get("field_tech")]
+    configured_ids = {m["hcp_id"] for m in team if m.get("hcp_id")}
+    if not configured_ids:
+        problems.append("no field techs configured")
+        lines.append("║  ✗ No field techs with hcp_id in config — capacity, week-schedule")
+        lines.append("║      and pipeline tools will return empty results.")
+        advice.append("Run setup_wizard.py to populate team[].hcp_id from your account.")
+    else:
+        try:
+            async with _hcp_client() as client:
+                emp, err = await _get_json(client, "/employees",
+                                           {"page": 1, "page_size": 200})
+            live = {e.get("id") for e in ((emp or {}).get("employees") or [])}
+            missing = configured_ids - live if live else set()
+            if err:
+                lines.append(f"║  ⚠ Could not verify team IDs — {err}")
+            elif missing:
+                problems.append(f"{len(missing)} configured tech IDs not in this account")
+                lines.append(f"║  ✗ {len(missing)} of {len(configured_ids)} configured tech IDs "
+                             f"do NOT exist in this account:")
+                for m in team:
+                    if m.get("hcp_id") in missing:
+                        lines.append(f"║      {m.get('name','?')}  {m['hcp_id']}")
+                advice.append("These IDs are from a different HCP account. "
+                              "Re-run setup_wizard.py.")
+            else:
+                lines.append(f"║  ✓ All {len(configured_ids)} configured field-tech IDs "
+                             f"exist in this account")
+        except Exception as e:
+            lines.append(f"║  ⚠ Could not verify team IDs — {type(e).__name__}")
+
+    # ── 5. pipeline stage IDs ────────────────────────────────────────────────
+    stages = cfg.get("job_pipeline_stages") or []
+    if not stages:
+        lines.append("║  ⚠ No job_pipeline_stages configured — hcp_pipeline_board and")
+        lines.append("║      hcp_set_pipeline_status need them.")
+        advice.append("setup_wizard.py will pull your pipeline stages, or call "
+                      "hcp_get_pipeline_statuses and paste them in.")
+    else:
+        lines.append(f"║  ✓ {len(stages)} pipeline stages configured")
+
+    # ── verdict ──────────────────────────────────────────────────────────────
+    lines.append("╠══════════════════════════════════════════════════════════════")
+    if problems:
+        lines.append(f"║  RESULT: {len(problems)} problem(s) to fix:")
+        for p in problems:
+            lines.append(f"║    • {p}")
+    else:
+        lines.append("║  RESULT: ready to use ✓")
+    if advice:
+        lines.append("║")
+        lines.append("║  Next steps:")
+        for a in dict.fromkeys(advice):
+            lines.append(f"║    → {a}")
+    lines.append(f"╚{'═' * 61}")
     return "\n".join(lines)
 
 

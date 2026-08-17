@@ -1,0 +1,134 @@
+{
+  "_comment": "EXAMPLE ONLY — do not use as-is. Run `uv run python setup_wizard.py` to generate a real config.json for YOUR Housecall Pro account. The hcp_id and pipeline-stage id values below are fake; real ones are unique per account, so a config copied between accounts matches nothing and every capacity/pipeline tool silently returns empty. Run `hcp_check_setup` in Claude to confirm your config matches your account.",
+
+  "company": {
+    "name": "Your Company Name",
+    "short_name": "YOURCO",
+    "timezone": "America/Chicago"
+  },
+
+  "scheduling": {
+    "productive_hours_per_day": 8.0,
+    "appointment_window_hours": 8.5,
+    "blended_cost_per_tech_hour": 95.0,
+    "capacity_target_hours_per_day": 44.0,
+    "overtime_threshold_hours_per_day": 40,
+    "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+
+    "notes": "productive_hours_per_day is real working capacity. appointment_window_hours is the window you block on the calendar, including the unpaid break. The DIFFERENCE between them (here 0.5h = 30 min) is subtracted from any day of 6h or more when computing actual worked hours. Set these to match how you actually book days.",
+    "blended_cost_note": "Fully-loaded cost per tech-hour: wages, payroll burden, vehicle, insurance, overhead. This drives every margin number, so use YOUR figure — 95.0 is a placeholder.",
+
+    "full_day_min_hours": 6.0,
+    "anchor_tolerance_hours": 4.0,
+    "early_finish_tolerance_hours": 24.0,
+    "cluster_gap_days": 7,
+    "_tuning_notes": "Optional. full_day_min_hours: shortest day that gets a break deducted. anchor_tolerance_hours: how far started_at may sit from the scheduled start and still be trusted. early_finish_tolerance_hours: how early completed_at may be and still count as a real early finish (finishing early is real signal; finishing 'late' past the tolerance is usually paperwork after leaving site). cluster_gap_days: gap within which two jobs for the same customer+address are treated as one split project. Defaults are fine unless your crews work unusual patterns."
+  },
+
+  "team": [
+    {
+      "name": "Example Lead Tech",
+      "role": "lead_tech",
+      "hcp_id": "pro_REPLACE_WITH_REAL_ID_FROM_YOUR_ACCOUNT",
+      "field_tech": true,
+      "capacity_multiplier": 1.0,
+      "notes": "Full-time field tech. Counts 1.0x toward capacity."
+    },
+    {
+      "name": "Example Apprentice",
+      "role": "apprentice",
+      "hcp_id": "pro_REPLACE_WITH_REAL_ID_FROM_YOUR_ACCOUNT",
+      "field_tech": true,
+      "capacity_multiplier": 0.5,
+      "notes": "Counts 0.5x toward capacity but can still be booked a full day."
+    },
+    {
+      "name": "Example Owner",
+      "role": "owner_estimator",
+      "hcp_id": null,
+      "field_tech": false,
+      "capacity_multiplier": 0,
+      "notes": "Sales and estimating only. field_tech false keeps them out of capacity math."
+    }
+  ],
+
+  "job_pipeline_stages": [
+    {
+      "order": 1,
+      "name": "New Job",
+      "id": "kcs_REPLACE_WITH_REAL_ID_FROM_YOUR_ACCOUNT",
+      "status_type": "job_plain",
+      "used_for": ["job"],
+      "notes": "Get your real stages by asking Claude to run hcp_get_pipeline_statuses, or let setup_wizard.py fill them in."
+    }
+  ],
+
+  "tags": {
+    "_comment": "Optional. A job-tag convention the scheduling tools understand. This is one franchise's system — adopt, change, or delete it. Tools degrade gracefully when tags are absent; they just flag jobs as untagged.",
+    "CREW": {
+      "description": "Staffing requirement for the job",
+      "values": {
+        "CREW-1L": "1 lead tech only",
+        "CREW-2L": "2 lead techs",
+        "CREW-1L1A": "1 lead + 1 apprentice",
+        "CREW-TBD": "Not yet decided — treated as a 2-person default"
+      },
+      "missing_tag_default": "2-person crew",
+      "missing_tag_flag": true
+    },
+    "SCH": {
+      "description": "Scheduling urgency and timing",
+      "values": {
+        "SCH-URGENT": { "priority": 0, "meaning": "Must schedule ASAP" },
+        "SCH-1W": { "priority": 1, "meaning": "Book within 1 week" },
+        "SCH-2W": { "priority": 2, "meaning": "Book within 2 weeks" },
+        "SCH-FLEX": { "priority": 5, "meaning": "Fit where capacity allows" },
+        "SCH-MAT": { "priority": 6, "meaning": "Waiting on materials" },
+        "SCH-FOLLOWUP": { "priority": 99, "meaning": "Needs a return call before scheduling" }
+      },
+      "missing_tag_flag": true
+    },
+    "JOB": {
+      "description": "Work location and job type",
+      "values": {
+        "JOB-IN": "Interior only",
+        "JOB-OUT": "Exterior only",
+        "JOB-INOUT": "Both",
+        "JOB-WARRANTY": "Warranty return visit — tracked separately in post-job analysis"
+      }
+    },
+    "MAT": {
+      "description": "Material sourcing",
+      "values": {
+        "MAT-SO": "Special order — do not schedule until confirmed in hand",
+        "MAT-HD": "Big-box, same-day pickup",
+        "MAT-LLT": "Long lead time — do not schedule until in hand"
+      }
+    },
+    "TOOL": {
+      "description": "Special equipment required on site",
+      "values": {
+        "TOOL-SCAFF": "Scaffolding",
+        "TOOL-LIFT": "Lift rental",
+        "TOOL-EXL": "Extended ladder",
+        "TOOL-OTHER": "Other — check job notes"
+      }
+    }
+  },
+
+  "api": {
+    "base_url": "https://api.housecallpro.com",
+    "auth_header": "Authorization: Token {API_KEY}",
+    "known_quirks": [
+      "Dollar amounts are integers in CENTS — divide by 100 to display.",
+      "Line items endpoint returns {object, data, url} — read 'data', not 'line_items'.",
+      "Job date filters are scheduled_start_min / scheduled_start_max and REQUIRE a trailing Z on the timestamp.",
+      "work_status filter values (unscheduled/scheduled/in_progress/completed/canceled) differ from the display strings the API returns ('needs scheduling', 'in progress', 'complete rated', ...). The filter must be sent as an array.",
+      "Job and Estimate schedule objects use scheduled_start/scheduled_end/arrival_window. Appointment and Event objects use start_time/end_time/arrival_window_minutes. Mixing them up renders '?' rather than erroring.",
+      "Only started_at/completed_at exist on work_timestamps — there is no per-tech time tracking and no pause data in the public API.",
+      "/api/price_book/services returns service_materials and service_labor_rates as empty arrays unless you pass expand[].",
+      "Canceled jobs are archived; /jobs/{id}/appointments returns HTTP 400 'Archived job' for them permanently.",
+      "Fanning out more than ~90 concurrent job sub-requests draws HTTP 429. Never treat a failed fetch as an empty payload — it silently becomes '0 quoted hours'."
+    ]
+  }
+}

@@ -1,523 +1,406 @@
-# Housecall Pro + Claude Desktop — MCP Server
+# Housecall Pro + Claude — MCP Server
 
-Connect Claude Desktop to your Housecall Pro account so you can ask questions, analyze your schedule, track finances, and manage jobs in plain English — no spreadsheet exports, no digging through menus.
+Connects Claude to your Housecall Pro account so you can review the schedule,
+plan capacity, and measure **quoted vs. scheduled vs. actually-worked hours** by
+talking to it in plain language.
 
-This server was built for handyman and home services companies running on Housecall Pro. Each franchise owner installs it on their own machine with their own API key — you each connect to your own HCP account independently.
+Built by and for a home-services franchise. Runs entirely on your own machine
+against your own API key — no third-party servers involved.
 
----
-
-## What can it do?
-
-**Ask Claude things like:**
-> *"Show me the full schedule for next week with projected hours per tech"*
-> *"Which jobs are outstanding and haven't been invoiced yet?"*
-> *"Show me all jobs that came in from Google Ads this year"*
-> *"Add the SCH-FOLLOWUP tag to Job #274"*
-> *"Which jobs are missing crew tags?"*
-> *"What's our total revenue for April vs March?"*
-
-Claude understands natural language — no special commands required.
+```
+You:    How did last week's jobs stack up against what we quoted?
+Claude: [runs hcp_time_variance]
+        MEASURED (21 jobs, fully timestamp-anchored)
+          Quoted 91.8 → Actual 92.5 tech-hrs   (101% — quoting is accurate)
+          Scheduled was 129.2 → 36.8 tech-hrs of calendar blocked but not worked
+```
 
 ---
 
-## Before you start — what you need
+## Contents
 
-1. **Claude Desktop** (the app, not the website) — download free at [claude.ai/download](https://claude.ai/download)
-2. **A Housecall Pro account on the MAX plan** — the API is only available on MAX
-3. **Your computer** — Mac or Windows, instructions below cover both
-
----
-
-## Part 1 — Get your Housecall Pro API key
-
-Every franchise owner does this step with **their own HCP login**. Your API key connects Claude to *your* account only.
-
-1. Log in to Housecall Pro at [app.housecallpro.com](https://app.housecallpro.com)
-2. Click your name/avatar → **Settings** → **Integrations** → **API**
-3. Copy your API key and save it temporarily (Notepad/TextEdit)
-
-> If you don't see the API option, your account may not be on MAX plan. Contact Housecall Pro support to confirm.
+- [What you need](#what-you-need)
+- [Install](#install) — five steps, about 15 minutes
+- [Verify it worked](#verify-it-worked)
+- [The time model](#the-time-model-read-this-before-trusting-the-numbers) ← **read this**
+- [What to ask Claude](#what-to-ask-claude)
+- [Tool reference](#tool-reference)
+- [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [Security](#security)
+- [For franchise partners](#for-franchise-partners)
 
 ---
 
-## Part 2 — Download the server files
+## What you need
 
-Download the `housecallpro_mcp` folder from wherever it was shared with you.
+| | |
+|---|---|
+| **Housecall Pro MAX plan** | API access is MAX-only. Without it, nothing here works. |
+| **Claude Desktop** | [claude.ai/download](https://claude.ai/download). Also works with Claude Code and Cowork. |
+| **A terminal** | Terminal on macOS, PowerShell on Windows. You'll paste a few commands. |
+| **~15 minutes** | Mostly waiting on downloads. |
 
-Place it somewhere **permanent** — don't move it after setup:
-- **Mac:** `/Users/YOUR_NAME/Documents/housecallpro_mcp`
-- **Windows:** `C:\Users\YOUR_NAME\Documents\housecallpro_mcp`
+You do **not** need to know Python.
 
 ---
 
-## Part 3 — Install uv
+## Install
 
-`uv` is a free tool that runs the Python server. Install it once and it handles everything else automatically.
+### 1. Get your API key
 
-**Mac:**
+Housecall Pro → **Settings** → **Integrations** → **API** → create a key and copy it.
+
+Treat it like a password: it can read customer data and create and modify jobs,
+estimates, and invoices.
+
+### 2. Install `uv`
+
+`uv` runs the server and manages Python for you. The system Python on most Macs
+is too old (3.9); `uv` handles that.
+
+**macOS**
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
-Close and reopen Terminal, then verify: `~/.local/bin/uv --version`
 
-**Windows** (PowerShell):
+**Windows (PowerShell)**
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
-Close and reopen PowerShell, then verify: `uv --version`
 
----
+Close and reopen your terminal, then confirm:
+```bash
+uv --version
+```
 
-## Part 4 — Configure Claude Desktop
+### 3. Download this repo
 
-Find the config file:
-- **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-  *(Finder → Cmd+Shift+G → paste that path)*
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-  *(Windows+R → paste that path)*
+```bash
+git clone <REPO_URL> housecallpro_mcp
+cd housecallpro_mcp
+```
 
-Replace the contents with the appropriate block below, substituting **YOUR_NAME** and your API key:
+No git? Use GitHub's **Code → Download ZIP**, unzip it, and `cd` into the folder.
 
-**Mac:**
+### 4. Run the setup wizard
+
+```bash
+uv run python setup_wizard.py
+```
+
+This is the step that makes the tool yours. It will:
+
+- verify your API key against Housecall Pro
+- pull **your** employees, pipeline stages, and price-book labor rates
+- ask which people are field techs (so owners and office staff don't inflate capacity)
+- ask for your fully-loaded cost per tech-hour
+- write `config.json`
+- print the exact Claude Desktop block to paste, with correct paths for your machine
+
+> **Why a wizard instead of a config file to copy?** Employee IDs (`pro_…`) and
+> pipeline-stage IDs (`kcs_…`) are unique per Housecall Pro account. A config
+> copied from another franchise looks perfectly valid but matches nothing in your
+> account — capacity and pipeline tools then return empty results without any
+> error. The wizard builds the config from your own account so that can't happen.
+
+### 5. Add to Claude Desktop and restart
+
+Open your Claude Desktop config:
+
+- **macOS** — `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows** — `%APPDATA%\Claude\claude_desktop_config.json`
+
+Paste the block the wizard printed, with your real API key. It looks like:
+
 ```json
 {
   "mcpServers": {
     "housecallpro": {
-      "command": "/Users/YOUR_NAME/.local/bin/uv",
-      "args": [
-        "run",
-        "--project",
-        "/Users/YOUR_NAME/Documents/housecallpro_mcp",
-        "python",
-        "/Users/YOUR_NAME/Documents/housecallpro_mcp/server.py"
-      ],
-      "env": {
-        "HCP_API_KEY": "PASTE_YOUR_API_KEY_HERE"
-      }
+      "command": "uv",
+      "args": ["run", "--project", "/full/path/to/housecallpro_mcp",
+               "python", "/full/path/to/housecallpro_mcp/housecallpro_LHSTL.py"],
+      "env": { "HOUSECALL_PRO_API_KEY": "your_key_here" }
     }
   }
 }
 ```
 
-**Windows:**
-```json
-{
-  "mcpServers": {
-    "housecallpro": {
-      "command": "C:\\Users\\YOUR_NAME\\.local\\bin\\uv.exe",
-      "args": [
-        "run",
-        "--project",
-        "C:\\Users\\YOUR_NAME\\Documents\\housecallpro_mcp",
-        "python",
-        "C:\\Users\\YOUR_NAME\\Documents\\housecallpro_mcp\\server.py"
-      ],
-      "env": {
-        "HCP_API_KEY": "PASTE_YOUR_API_KEY_HERE"
-      }
-    }
-  }
-}
-```
+If the file already has `mcpServers`, add `"housecallpro"` alongside the existing
+entries rather than replacing the block. Paths must be absolute.
 
-> **Don't know your username?** Run `whoami` in Terminal (Mac) or PowerShell (Windows).
-
-> **Config file already has content?** Add only the `"mcpServers"` block inside the existing `{}` — don't replace the whole file. Paste your config into [jsonlint.com](https://jsonlint.com) to catch formatting errors.
+Then **fully quit** Claude Desktop — Cmd+Q on macOS, not just closing the window —
+and reopen it.
 
 ---
 
-## Part 5 — Restart Claude Desktop
+## Verify it worked
 
-Fully quit Claude (Cmd+Q on Mac, or right-click tray icon → Quit on Windows) and relaunch.
+Ask Claude:
 
-> Simply closing the window is **not enough** — you must fully quit and relaunch.
+```
+run hcp_check_setup
+```
 
-**First launch takes 20–40 seconds** while it downloads Python and installs packages. After that it starts instantly.
+You should see something like:
+
+```
+╔══ SETUP CHECK ═══════════════════════════════════════════════
+║  ✓ API key works — connected to: Your Company Name
+║  ✓ Config found — /path/to/housecallpro_mcp/config.json
+║  ✓ Labor cost rate: $95.00/tech-hour
+║  ✓ All 6 configured field-tech IDs exist in this account
+║  ✓ 21 pipeline stages configured
+╠══════════════════════════════════════════════════════════════
+║  RESULT: ready to use ✓
+```
+
+`hcp_check_setup` cross-checks your config against the live account, so it catches
+the failure that is otherwise invisible: IDs that belong to a different company.
+Run it again any time a tool returns empty or implausible numbers.
 
 ---
 
-## Part 6 — Verify it's working
+## The time model (read this before trusting the numbers)
 
-1. Open a new chat in Claude Desktop
-2. Look for a **tools icon** (hammer) in the chat input area — click it and you should see the `hcp_*` tools listed
-3. Type: **"List my Housecall Pro employees"**
+Housecall Pro's public API exposes **one** `started_at` and **one** `completed_at`
+per job — never per appointment or per tech. There is no per-tech time tracking
+and no pause data. Everything below follows from that limit.
 
-You should see your real team returned from your HCP account.
+**Actual hours are built per day, not as one span.** For each appointment day:
+
+```
+day 1      real started_at   →  scheduled end
+middle     scheduled window     (inference — no data exists for these)
+last day   scheduled start   →  real completed_at
+```
+
+Each day is multiplied by the crew dispatched *that day*, minus the unpaid break
+on any day of 6h or more. Measuring instead as one `started_at → completed_at`
+span is what makes a two-week job read as 300 hours.
+
+**Every job carries a confidence grade.** Nothing is silently averaged in:
+
+| Grade | Meaning | Trust |
+|---|---|---|
+| `MEASURED` | Single day, both edges backed by real timestamps | High — use these |
+| `ESTIMATED` | Multi-day; outer edges anchored, middle days from the schedule | Directional; check `Cov%` |
+| `SCHEDULED` | Timestamps unusable (stale start, late closeout). "Actual" is just the schedule | No information |
+| `UNMEASURABLE` | No per-day record at all | None |
+
+`Cov%` is the share of day boundaries backed by a real timestamp. A single-day job
+is 100%; a ten-day job can only ever reach 10%, so low coverage on a long job is
+structural, not a data problem.
+
+### Two traps worth knowing
+
+**1. `MEASURED` skews small.** Single-day jobs are small jobs. In one year of
+data, jobs quoted under 4h were 61 measured / 9 estimated, while jobs over 50h
+were **0 measured / 9 estimated**. A clean "quoting is accurate" result from the
+MEASURED block is a statement about *short* jobs. Large jobs can only be
+estimated — so judge them from `ESTIMATED` and read it as crew-time committed,
+not stopwatch time.
+
+**2. For `ESTIMATED` jobs, actual ≈ scheduled by construction.** Middle days come
+from the calendar, so a combined MEASURED+ESTIMATED overrun figure partly measures
+calendar blocking rather than worked time. The tool prints this caveat inline.
+Judge quote accuracy from the MEASURED-ONLY block.
+
+### What good data looks like
+
+The model leans on your techs' start/complete timestamps. Where they're reliable,
+you get real measurement. The failure modes it detects and names:
+
+- **closeout drift** — job closed hours or days after leaving site
+- **stale start** — job started long before the appointment
+- **late start** — started well after the scheduled time
+- **appointments incomplete** — quoted hours exceed booked calendar time by >2x
+
+`hcp_time_variance` lists these by reason as a work list. Fix the timestamps and
+those jobs become measurable.
 
 ---
 
-## Part 7 — First time setup: Tell Claude about your business
+## What to ask Claude
 
-When you start your first session, paste this to give Claude context about your operation:
+Plain language works — you don't need tool names.
 
+**Before the week**
 ```
-I run a handyman / home services company on Housecall Pro. Here's what you should know:
-
-Team: [list your techs and any notes — e.g. who is lead vs apprentice]
-Work week: [e.g. Monday–Friday, typical start time]
-Job volume: [e.g. roughly X jobs per week]
-Average job size: [e.g. $500–$5,000, multi-day projects common]
-
-Tag system we use:
-- CREW-* = crew size/composition (CREW-1L, CREW-2L1A, CREW-TBD, etc.)
-- SCH-* = scheduling urgency (SCH-URGENT, SCH-1W through SCH-4W, SCH-FLEX, SCH-MAT, SCH-FOLLOWUP)
-- JOB-* = location type (JOB-IN, JOB-OUT, JOB-INOUT)
-- MAT-* = material sourcing (MAT-HD, MAT-LO, MAT-SO, etc.)
-- TOOL-* = special tool needs (TOOL-SCAFF, TOOL-LIFT, TOOL-BRAKE, etc.)
-- SCH-FOLLOWUP = job needs a return call before scheduling
-
-My two main weekly workflows are:
-1. Pre-week planning (Sunday/Monday morning): Who's working what, projected hours, gaps
-2. Post-week financial review (Friday afternoon): Revenue collected, outstanding invoices, actual vs projected hours
-
-What would you like to tackle first?
+Show me next week's schedule with capacity by day.
+What's in the backlog that should be scheduled first?
+Show me the pipeline board.
+Give me a four-week view — where are we overbooked?
 ```
 
-Claude will ask clarifying questions and help you get started right away.
-
----
-
-## Suggested first prompts by workflow
-
-### 📅 Pre-week scheduling
-
+**After the week**
 ```
-Show me the full schedule for the week of [date]. Include:
-- Who is dispatched to each job each day
-- Projected hours per job
-- Whether each job is on track to finish this week
-- Any gaps or unassigned time
+Run a time variance for last week.
+How did we do on quoted vs actual hours this month?
+Full analysis on job 4821.
+Which jobs ran furthest over quote this quarter?
 ```
 
+**Data quality**
 ```
-List all jobs with status 'scheduled' or 'in progress'. 
-For each one show projected hours remaining and who's assigned.
-```
-
-```
-Which jobs have the SCH-FOLLOWUP tag? I need to call those customers.
+Which completed jobs have no usable actual time, and why?
+Show me jobs where the appointments don't cover the quoted hours.
 ```
 
+**Estimating**
 ```
-Are there any jobs this week that are missing crew tags or scheduling tags?
-```
-
-### 💰 Post-week financial review
-
-```
-Show all invoices from this week. What's the total billed, total collected, 
-and what's still outstanding?
-```
-
-```
-Which completed jobs from this week still have outstanding balances?
-List the customer, job number, amount due, and job value.
-```
-
-```
-Compare projected hours to actual elapsed time for jobs completed this week.
-Flag anything where actual was significantly more than projected.
-```
-
-```
-What were our top 5 jobs by revenue this month?
-```
-
-### 🔍 Customer & lead source analysis
-
-```
-Show me all customers who came from [lead source name].
-How many jobs did they generate and what's the total revenue?
-```
-
-```
-Search for customer [name or phone number].
-Show their full job history and any outstanding balances.
-```
-
-```
-Which jobs this year are missing a lead source? 
-I need to reconcile those for our marketing analysis.
-```
-
-### 📆 Scheduling (read & write)
-
-```
-Show me the full schedule for Monday April 28th.
-```
-
-```
-Add a new appointment to Job #[number] for Wednesday May 6th, 
-7:30 AM to 4:00 PM, dispatched to [tech name].
-```
-
-```
-Move Job #[number]'s Thursday appointment to Friday — same time, same crew.
-```
-
-```
-Job #[number] wrapped up early. Delete the remaining appointment for Friday.
-```
-
-### 🏷️ Tag management
-
-```
-Pull my full tag list and show me all jobs that are tagged SCH-FOLLOWUP.
-```
-
-```
-Add the SCH-FOLLOWUP tag to Job #[number].
-```
-
-```
-Show me all scheduled jobs that are missing a CREW tag.
-```
-
-```
-Create a new tag called SCH-FOLLOWUP.
-```
-*(Do this step when you first set up — see the tag checklist below)*
-
-### 🧾 Estimates & pipeline
-
-```
-Show me all open estimates from the last 30 days. 
-Which ones haven't been converted to jobs yet?
-```
-
-```
-Pull the estimate for [customer name] and summarize the scope and pricing.
+Pull up the estimating brief for estimate 1116.
+What labor rates and standard hours are in my price book?
 ```
 
 ---
 
-## Available tools
+## Tool reference
 
-### Customers
-| Tool | What it does |
-|------|-------------|
-| `hcp_list_customers` | Search/list customers |
-| `hcp_get_customer` | Full customer detail |
-| `hcp_create_customer` | Create a new customer |
+**43 tools** on the main server (`housecallpro_LHSTL.py`), formatted for reading.
+
+### Analysis
+| Tool | Purpose |
+|---|---|
+| `hcp_time_variance` | Quoted vs scheduled vs actual across a date range, graded, with split-project rollup and a data-quality work list |
+| `hcp_post_job_analysis` | One job end to end: hours by day, revenue, labor and material cost, margin, payment speed |
+| `hcp_check_setup` | Validate key, config, and whether configured IDs exist in this account |
+
+### Scheduling and capacity
+`hcp_get_week_schedule` · `hcp_multi_week_view` · `hcp_job_backlog` ·
+`hcp_get_routes` · `hcp_list_events` · `hcp_create_appointment` ·
+`hcp_update_appointment` · `hcp_delete_appointment`
 
 ### Jobs
-| Tool | What it does |
-|------|-------------|
-| `hcp_list_jobs` | List jobs with filters (status, date, employee) |
-| `hcp_get_job` | Full job detail |
-| `hcp_get_job_line_items` | Services & materials, projected hours |
-| `hcp_get_job_invoice` | Invoice with line items and payment status |
-| `hcp_get_job_input_materials` | Materials logged on a job |
-| `hcp_add_job_note` | Add a note to a job |
+`hcp_list_jobs` · `hcp_get_job` · `hcp_get_job_line_items` ·
+`hcp_get_job_appointments` · `hcp_get_job_invoice` ·
+`hcp_get_job_input_materials` · `hcp_add_job_note` · `hcp_add_job_tag` ·
+`hcp_remove_job_tag`
 
-### Scheduling
-| Tool | What it does |
-|------|-------------|
-| `hcp_get_routes` | **Every tech's full day** — all appointments, events, estimates by employee for a given date. Fastest schedule view. |
-| `hcp_get_job_appointments` | All appointment windows for a job, with dispatched techs per appointment |
-| `hcp_create_appointment` | Add a new appointment day to a job, assign techs |
-| `hcp_update_appointment` | Change date, time, or crew on an existing appointment |
-| `hcp_delete_appointment` | Remove an appointment from a job |
-| `hcp_list_events` | Non-job calendar events (time off, meetings, etc.) |
+### Estimates
+`hcp_list_estimates` · `hcp_get_estimate` · `hcp_get_estimate_brief` ·
+`hcp_write_estimate` · `hcp_get_estimate_line_items` ·
+`hcp_update_estimate_line_items` · `hcp_add_estimate_note` ·
+`hcp_finalize_estimate` · `hcp_approve_estimate_option` ·
+`hcp_upload_estimate_pdf`
 
-### Invoices & Estimates
-| Tool | What it does |
-|------|-------------|
-| `hcp_list_invoices` | List invoices with rich filters |
-| `hcp_get_invoice` | Full invoice detail by UUID |
-| `hcp_list_estimates` | List estimates |
-| `hcp_get_estimate` | Single estimate detail |
+### Pipeline
+`hcp_pipeline_board` · `hcp_get_pipeline_statuses` · `hcp_set_pipeline_status`
 
-### Team & Configuration
-| Tool | What it does |
-|------|-------------|
-| `hcp_list_employees` | List all active employees with IDs |
-| `hcp_list_lead_sources` | All configured lead sources |
-| `hcp_list_tags` | All tags, grouped by prefix |
-| `hcp_create_tag` | Create a new tag |
-| `hcp_update_tag` | Rename an existing tag |
-| `hcp_add_job_tag` | Add a tag to a job |
-| `hcp_remove_job_tag` | Remove a tag from a job |
+### Customers, invoices, reference
+`hcp_list_customers` · `hcp_get_customer` · `hcp_create_customer` ·
+`hcp_list_invoices` · `hcp_get_invoice` · `hcp_list_employees` ·
+`hcp_list_tags` · `hcp_create_tag` · `hcp_update_tag` · `hcp_list_lead_sources`
+
+### Optional: raw passthrough servers
+
+The 20 `housecallpro_<domain>.py` files are thin wrappers returning raw JSON
+(`housecallpro_jobs.py`, `_estimates.py`, `_leads.py`, `_webhooks.py`, …). Most
+people never need them — the main server covers normal use with readable output.
+Register one only when you want unformatted API access to a specific area, by
+adding another `mcpServers` entry pointing at that file.
 
 ---
 
-## Tag system setup checklist
+## Configuration
 
-When you first set up this integration, run through this checklist to make sure your tags are ready:
+`config.json` is generated by the wizard and gitignored. `config.example.json` is
+the annotated template.
 
-```
-Pull my full tag list and tell me which of these standard tags are missing:
+Settings worth revisiting:
 
-CREW: CREW-TBD, CREW-1L, CREW-2L, CREW-3L, CREW-4L, 
-      CREW-1L1A, CREW-2L1A, CREW-3L1A, CREW-1L2A, CREW-2L2A
+| Key | Why it matters |
+|---|---|
+| `scheduling.blended_cost_per_tech_hour` | Drives every margin number. Use your fully-loaded cost — wages, burden, vehicle, insurance, overhead. |
+| `scheduling.productive_hours_per_day` | Real working capacity per tech (e.g. 8.0). |
+| `scheduling.appointment_window_hours` | The window you block on the calendar (e.g. 8.5). |
+| `team[].field_tech` | Only field techs count toward capacity. Exclude owners and office staff. |
+| `team[].capacity_multiplier` | `0.5` for apprentices — still bookable a full day, but counted half. |
 
-SCH: SCH-URGENT, SCH-FLEX, SCH-1W, SCH-2W, SCH-3W, SCH-4W, 
-     SCH-TBD, SCH-MAT, SCH-FOLLOWUP
+The gap between `appointment_window_hours` and `productive_hours_per_day` **is**
+the unpaid break the model deducts from full days. Set both to match how you
+actually book.
 
-JOB: JOB-IN, JOB-OUT, JOB-INOUT
+Optional tuning keys (`anchor_tolerance_hours`, `cluster_gap_days`, …) are
+documented inline in `config.example.json`. Defaults are sensible.
 
-MAT: MAT-SO, MAT-HD, MAT-LO, MAT-ME, MAT-SW, MAT-LLT
+**After you add or remove a tech**, re-run the wizard or edit `team` by hand, then
+run `hcp_check_setup`.
 
-TOOL: TOOL-BRAKE, TOOL-SCAFF, TOOL-CMIX, TOOL-LIFT, TOOL-EXL, TOOL-OTHER
-
-Create any that are missing.
-```
-
-> **Note for franchise owners:** Your tag values may differ from the list above. Update the checklist to match your own naming conventions before running it.
-
----
-
-## Tag dictionary (Local Handyman standard)
-
-Customize this section for your franchise's tag conventions.
-
-### CREW-* — Staffing
-| Tag | Meaning |
-|-----|---------|
-| CREW-1L | 1 lead tech |
-| CREW-2L | 2 lead techs |
-| CREW-1L1A | 1 lead + 1 apprentice |
-| CREW-2L1A | 2 leads + 1 apprentice |
-| CREW-TBD | Crew not yet determined |
-| CREW-[Name] | Specific tech assigned |
-
-### SCH-* — Scheduling urgency
-| Tag | Meaning |
-|-----|---------|
-| SCH-URGENT | Schedule ASAP |
-| SCH-FLEX | Flexible timing |
-| SCH-1W through SCH-4W | Schedule within 1–4 weeks |
-| SCH-TBD | Scheduling pending decision |
-| SCH-MAT | Waiting on materials before scheduling |
-| SCH-FOLLOWUP | Needs a return call from office before scheduling |
-
-### JOB-* — Work location
-| Tag | Meaning |
-|-----|---------|
-| JOB-IN | Interior work only |
-| JOB-OUT | Exterior work only |
-| JOB-INOUT | Both interior and exterior |
-| JOB-RT-FEE | Return trip fee applies |
-
-### MAT-* — Material sourcing
-| Tag | Meaning |
-|-----|---------|
-| MAT-SO | Special order required |
-| MAT-HD | Home Depot |
-| MAT-LO | Lowes |
-| MAT-ME | Menards |
-| MAT-SW | Sherwin Williams |
-| MAT-LLT | Long lead time |
-
-### TOOL-* — Special equipment needed
-| Tag | Meaning |
-|-----|---------|
-| TOOL-BRAKE | Sheet metal brake |
-| TOOL-SCAFF | Scaffolding |
-| TOOL-CMIX | Concrete mixer |
-| TOOL-LIFT | Boom/scissor lift |
-| TOOL-EXL | Extension ladder (tall) |
-| TOOL-OTHER | Other specialty tool |
-
----
-
-## Using this with Cowork
-
-Everything this server can do in Claude Desktop works identically in **Cowork** — the same 26 tools, the same live HCP data.
-
-Where Cowork becomes more powerful is when you combine live HCP data with data from your other platforms. In a Cowork session you can:
-
-- Ask questions that pull live data from HCP via these tools
-- Upload reports or exports from Google Ads, QuickBooks, or any other platform
-- Have Claude analyze everything together in a single conversation
-
-**Example workflow — full business review:**
-1. Open a Cowork session
-2. Say: *"Pull all completed jobs from last week with revenue and lead source"* — Claude pulls live from HCP
-3. Drag in your Google Ads CSV export for the same week
-4. Drag in a QuickBooks P&L or expense report
-5. Ask: *"Calculate our customer acquisition cost by lead source, net margin per job, and compare actual labor cost to what we projected"*
-
-Claude holds all of it in context simultaneously and reasons across all the data sources.
-
-### What to pull from each platform
-
-| Platform | What to export | What it enables |
-|----------|---------------|-----------------|
-| **Housecall Pro** | Live via MCP — no export needed | Jobs, revenue, hours, customers, schedule |
-| **Google Ads** | Campaign performance report (CSV) | Spend by campaign, clicks, conversions |
-| **Google Local Services** | Leads report | Cost per lead, lead volume by week |
-| **QuickBooks** | P&L report, payroll summary, expenses by vendor | Labor cost, materials cost, overhead, true margins |
-| **Angi / Yelp / Thumbtack** | Leads or spend report | CAC by platform |
-| **Any other platform** | CSV or Excel export | Claude can read any tabular format |
-
-### Key analyses you can run
-
-**Customer Acquisition Cost (CAC) by lead source:**
-```
-Here's my Google Ads spend for April [attach CSV] and my Google Local Services report [attach].
-Pull all April jobs from HCP with their lead sources.
-Calculate CAC per lead source: total ad spend ÷ number of new customers acquired per channel.
-```
-
-**True job margin:**
-```
-Here's my QuickBooks payroll summary for the week [attach].
-Pull all completed jobs from this week with projected hours and revenue.
-Calculate: revenue − materials cost − labor cost (hours × burdened rate) = gross margin per job.
-Flag any job where margin is under 40%.
-```
-
-**Tech productivity:**
-```
-Pull all completed jobs this month. For each tech, show:
-- Total hours dispatched
-- Total revenue on jobs they worked
-- Revenue per hour
-- Jobs completed
-```
-
-**Weekly P&L in 5 minutes:**
-```
-Pull this week's completed jobs, invoices sent, and collections.
-Here's this week's QuickBooks expense summary [attach].
-Give me: revenue collected, revenue invoiced, outstanding AR, estimated gross margin.
-```
-
----
-
-**Projected hours** — The `quantity` field on labor line items is the projected hours for that scope. Use this for scheduling and estimating how long jobs will take.
-
-**Appointment-level scheduling** — `hcp_get_job_appointments` shows who is *dispatched* to each specific appointment, not just who is assigned to the job overall. Use this for accurate weekly schedule analysis.
-
-**Dollar amounts** — All amounts are displayed in dollars. The API stores them in cents internally, but the server converts them automatically.
-
-**Job date filters** — The `scheduled_start_min/max` filters on `hcp_list_jobs` match the job's *primary* start date. For ongoing multi-week jobs, use a wide date range and then pull appointments to see which ones have work this specific week.
-
-**Work status values** — `unscheduled`, `scheduled`, `in_progress`, `completed`, `canceled`, `user_canceled`, `pro_canceled`
+You can point at a config elsewhere with the `HCP_CONFIG_PATH` environment
+variable.
 
 ---
 
 ## Troubleshooting
 
-**Tools icon not showing in Claude Desktop**
-- Fully quit and relaunch Claude (Cmd+Q on Mac, tray icon → Quit on Windows)
-- Check your config file for JSON errors at [jsonlint.com](https://jsonlint.com)
-- Verify your username is correct in all path locations
-- Mac: run `~/.local/bin/uv --version` in Terminal to confirm uv is installed
+**Tools don't appear in Claude**
+Quit Claude Desktop completely (Cmd+Q) and reopen. Then check the config file is
+valid JSON — a stray comma silently disables every server. Paths must be absolute.
 
-**Getting API errors**
-- Confirm your API key is correct — re-copy it from HCP Settings → Integrations → API
-- Confirm your HCP account is on the MAX plan
+**"HTTP 401" or "403"**
+Key is wrong, revoked, or the account isn't on MAX. Recopy from Settings →
+Integrations → API.
 
-**Windows path issues**
-- Run `(Get-Command uv).Source` in PowerShell to get the exact path to uv
+**"HTTP 429" / a run reports fewer jobs than expected**
+Rate limiting. The tools retry behind a shared backoff and then **name** any job
+they had to exclude — they never quietly report zero. Wait a minute and re-run.
+If you script against this API yourself, do the same: treating a failed fetch as
+an empty payload turns into "0 quoted hours" that looks like real data.
+
+**Capacity or pipeline tools return nothing**
+Almost always config. Run `hcp_check_setup` — it will tell you whether the config
+is missing, has no field techs, or holds IDs from another account.
+
+**Numbers look wrong on a specific job**
+Run `hcp_post_job_analysis` on it and read the `Confidence` line and the day
+breakdown. `SCHEDULED` grade means the timestamps weren't usable and you're
+looking at the calendar, not measured work.
+
+**`uv: command not found`**
+Reopen your terminal after installing `uv`, or use the full path
+(`~/.local/bin/uv`).
 
 ---
 
-## Security reminders
+## Security
 
-- Your API key gives access to your Housecall Pro account — treat it like a password
-- **Do not share your `claude_desktop_config.json`** — it contains your API key
-- Each franchise owner uses **their own API key** — never share keys across accounts
-- If your key is exposed, regenerate it from HCP Settings → Integrations → API
+- Your API key lives in the Claude Desktop config, which is gitignored here.
+- `config.json` holds no secrets, but it does hold employee names and your
+  account's IDs — it's gitignored, and it should not be shared between accounts.
+- Nothing leaves your machine except calls to `api.housecallpro.com`.
+- **This is not read-only.** The server can create and modify customers,
+  estimates, jobs, appointments, tags, notes, and invoices. Claude asks before
+  write actions, but review those prompts rather than approving reflexively.
+- No bulk-delete or bulk-lock tool is included, deliberately: those are hard to
+  undo through a chat interface.
+
+---
+
+## For franchise partners
+
+Everything account-specific is discovered by the wizard, so the normal path is:
+clone, run the wizard, paste the config block, restart, run `hcp_check_setup`.
+
+Three things are genuinely yours to decide:
+
+1. **Your cost per tech-hour.** The default is a placeholder. Margin math is
+   only as good as this number.
+2. **Your day model.** `productive_hours_per_day` and `appointment_window_hours`
+   should match how you actually book.
+3. **Your tag convention** (optional). `config.example.json` ships one
+   franchise's `CREW-` / `SCH-` / `JOB-` / `MAT-` / `TOOL-` system. Adopt it,
+   change it, or delete the `tags` block — the tools degrade gracefully and just
+   flag jobs as untagged.
+
+The filenames still say `LHSTL` (`housecallpro_LHSTL.py`) for continuity with
+existing installs. Renaming works if you also update the path in your Claude
+Desktop config.
+
+**A note on interpreting results.** The most useful early finding in one
+franchise's data was not underquoting — quoted and actual hours matched to within
+1% on measured jobs. It was that **40% more calendar time was blocked than the
+work needed**, and separately that sub-4-hour jobs consistently ran ~35% over
+quote while mid-size jobs were quoted well. Your numbers will differ. Start with
+`hcp_time_variance` over a month you remember well, and check the MEASURED block
+against your own sense of what happened before trusting the wider totals.
