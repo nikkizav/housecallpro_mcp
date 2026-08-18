@@ -81,6 +81,49 @@ own jobs, in a few minutes instead of a quarter.
 
 ---
 
+## It's not just one report
+
+Quoted-vs-actual is the headline because it's the thing nothing else can tell you.
+But most of the day-to-day value is more ordinary than that. Some things people
+actually say, and what you'd get back:
+
+**"I can't see where my week is actually going."**
+Next week laid out with capacity per day, who's on what, and where you're over or
+under. Then the same view four weeks out, so you spot the crunch while you can
+still do something about it.
+
+**"What should we schedule next?"**
+Your backlog in priority order — urgent first, then jobs waiting on materials,
+then the flexible ones. Plus a board of every active job by stage, so nothing sits
+forgotten in "waiting on parts" for three weeks.
+
+**"Did we actually make money on that job?"**
+One job, end to end: hours by day, what you charged, what the labor and materials
+cost you, gross margin, whether add-ons were billed, and how many days they took
+to pay.
+
+**"Where are our estimates stuck?"**
+Everything in the pipeline by stage, with a full brief on any single estimate —
+customer history, property notes, prior visits, and existing line items — pulled
+together before you walk in the door.
+
+**"Who owes us money?"**
+Invoices with what's still outstanding, filtered by due date so you can pull just
+what's overdue.
+
+**"Where are our good leads coming from?"**
+Lead sources across customers and jobs, so you can see which referral streams turn
+into real work instead of just calls.
+
+**"Can you just book it?"**
+Yes — it can create and move appointments, add notes and tags, build and send
+estimates, and update job stages. It asks before changing anything.
+
+You don't memorize any of that. You ask in your own words and it works out what to
+pull.
+
+---
+
 ## Being straight with you about the limits
 
 This is worth knowing before you decide, because it shapes what you can trust.

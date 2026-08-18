@@ -76,14 +76,18 @@ This key is how your computer proves it's allowed to read your account. **Treat 
 like your password.** Don't email it or paste it into a group chat. Later steps
 put it in a settings file on your own machine and nowhere else.
 
-### Step 2 — Open Terminal
+### Step 2 — Open the command window
 
-Terminal is a window where you type commands instead of clicking.
+This is a window where you type commands instead of clicking. Each system has its
+own name for it:
 
 - **Mac** — press `Cmd + Space`, type `Terminal`, press Enter.
-- **Windows** — press the Start key, type `PowerShell`, press Enter.
+- **Windows** — press the `Windows` key, type `PowerShell`, press Enter.
 
 A window with a blinking cursor opens. That's all it is.
+
+> From here on this guide says **"Terminal"** to mean *Terminal on Mac,
+> PowerShell on Windows*. Everything else is the same on both.
 
 ### Step 3 — Install the helper tool
 
@@ -116,9 +120,15 @@ Download this project: click the green **Code** button at the top of this page �
 **Download ZIP**. Unzip it, and move the folder somewhere you'll find again — your
 Documents folder is fine.
 
-Now point Terminal at that folder. Type `cd ` (with a space), then **drag the
-folder from Finder into the Terminal window** — that pastes the path for you.
-Press Enter.
+Now point Terminal at that folder. Type `cd ` — the letters c, d, then a space —
+and then drag the folder itself into the Terminal window. That pastes its location
+for you, so you never have to type it out. Press Enter.
+
+- **Mac** — drag the folder from **Finder**
+- **Windows** — drag the folder from **File Explorer**
+
+If dragging doesn't paste anything, type `cd ` and then the full folder location by
+hand (on Windows it starts with `C:\`).
 
 Then run the setup:
 
@@ -159,8 +169,16 @@ Paste in the block the setup wizard printed, and replace
 > your other tools. Ask Claude for help merging it; paste both blocks and it'll
 > show you the combined version.
 
-Finally, **quit Claude completely and reopen it**. On Mac that's `Cmd + Q`, not
-just closing the window. Closing the window is not enough.
+Finally, **quit Claude completely and reopen it.** Closing the window is not
+enough — Claude keeps running in the background, and it only picks up the new
+settings on a full restart.
+
+- **Mac** — press `Cmd + Q`, or Claude menu → Quit Claude
+- **Windows** — find the Claude icon in the system tray (bottom-right, next to the
+  clock; you may need to click the small `^` arrow to see hidden icons),
+  right-click it, choose **Quit**
+
+Then open Claude again.
 
 ---
 
@@ -269,9 +287,10 @@ quarter.
 ## When something goes wrong
 
 **Claude doesn't seem to know about my jobs**
-Quit Claude completely (`Cmd + Q`) and reopen. If still nothing, the settings file
-probably has a typo — one misplaced comma disables everything. Paste the file to
-Claude and ask it to check.
+Quit Claude completely and reopen — `Cmd + Q` on Mac, or right-click the tray icon
+→ Quit on Windows. Closing the window doesn't do it. If there's still nothing, the
+settings file probably has a typo; one misplaced comma disables everything. Paste
+the file to Claude and ask it to check.
 
 **"HTTP 401" or "403"**
 Your key is wrong, was deleted, or you're not on the MAX plan. Make a new one in
@@ -289,8 +308,10 @@ Almost always the setup. Run `hcp_check_setup`.
 Ask for a full analysis on it and read the **Confidence** line. `SCHEDULED` means
 the timestamps weren't usable and you're looking at your calendar, not real work.
 
-**"uv: command not found"**
-Close and reopen Terminal. It only works in a window opened *after* installing.
+**"uv: command not found"** (Mac) or **"uv is not recognized..."** (Windows)
+Close and reopen Terminal, then try again. The install only takes effect in a
+window opened *afterwards*. If it still isn't found on Windows, restart the
+computer once — that reliably fixes it.
 
 ---
 
