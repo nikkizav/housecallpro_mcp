@@ -161,7 +161,7 @@ lists them by name and reason, so that list doubles as a coaching sheet.
 | | |
 |---|---|
 | **This software** | Free and open source. Runs on your own computer. |
-| **Housecall Pro** | Must be on the **MAX plan** — API access is MAX-only. This is the real gate. |
+| **Housecall Pro** | Needs API access, which comes with the **MAX plan**. Every Local Handyman owner is already on MAX, so there's nothing to upgrade. |
 | **Claude** | The desktop app, signed in to a Claude account. |
 | **Setup time** | About 15 minutes, once. A setup script does the hard part. |
 | **Your crew** | Changes nothing. They keep using Housecall Pro exactly as they do now. |
@@ -205,6 +205,8 @@ much calendar are we blocking that we don't actually need?"**
 
 ---
 
-*Setup instructions are in [README.md](README.md). If you get stuck, ask Claude to
+*Setup instructions are in [README.md](README.md), and
+[FIRST_WEEK.md](FIRST_WEEK.md) covers what to ask once it's running. If you get
+stuck, ask Claude to
 "run hcp_check_setup" — it checks your setup and tells you in plain language what's
 wrong and how to fix it.*

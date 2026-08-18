@@ -9,7 +9,10 @@ You:  Show me next week's schedule and where we're overbooked.
 You:  Full breakdown on job 4821 — did we make money?
 ```
 
-New here and wondering whether this is worth it?
+Never heard of an MCP or an API, and not sure what you're looking at?
+**→ Start with [START_HERE.md](START_HERE.md)** (3 minutes, plain English).
+
+Wondering whether this is worth your time?
 **→ Read [WHY_THIS_HELPS.md](WHY_THIS_HELPS.md) first** (5 minutes, no technical
 background needed).
 
@@ -50,13 +53,18 @@ to think about it again.
 - [Safety](#safety)
 - [For the technically curious](#for-the-technically-curious)
 
+**Other pages:** [START_HERE.md](START_HERE.md) (what this is, in plain English) ·
+[WHY_THIS_HELPS.md](WHY_THIS_HELPS.md) (why bother) ·
+[FIRST_WEEK.md](FIRST_WEEK.md) (what to ask once it's running) ·
+[FAQ.md](FAQ.md) (questions people actually ask)
+
 ---
 
 ## Before you start
 
 | You need | Notes |
 |---|---|
-| **Housecall Pro on the MAX plan** | This is the real gate. Lower plans can't allow outside software to read your data, and there's no workaround. Check Settings → Integrations → API — if you don't see an API section, you're not on MAX. |
+| **Housecall Pro API access** | Comes with the MAX plan. Local Handyman owners are all on MAX, so there's nothing to check. Outside that network: look under Settings → Integrations → API, and if there's no API section you're on a lower plan and this won't work yet. |
 | **Claude desktop app** | Free to download at [claude.ai/download](https://claude.ai/download). Sign in with your Claude account. |
 | **About 15 minutes** | Mostly waiting on downloads. |
 
@@ -293,7 +301,7 @@ settings file probably has a typo; one misplaced comma disables everything. Past
 the file to Claude and ask it to check.
 
 **"HTTP 401" or "403"**
-Your key is wrong, was deleted, or you're not on the MAX plan. Make a new one in
+Your key is wrong, was deleted, or your plan doesn't include API access. Make a new one in
 Settings → Integrations → API.
 
 **"HTTP 429" or fewer jobs than expected**
