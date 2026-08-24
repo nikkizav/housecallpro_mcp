@@ -206,47 +206,82 @@ open** — you need it next.
 
 ### Step 5 — Connect it to Claude
 
-**First: install the Claude desktop app and open it at least once.** This matters
-more than it sounds. The folder you're about to look for doesn't exist until
-Claude has run once and created it. If you skip this, you'll get:
+**First: install the Claude desktop app and open it at least once.** The settings
+folder doesn't exist until Claude has run once and created it. Get it from
+[claude.ai/download](https://claude.ai/download), open it, sign in.
+
+### The easy way — let the wizard do it
+
+At the end of Step 4 the wizard asks:
 
 ```
-Windows cannot find 'C:\Users\yourname\AppData\Roaming\Claude'
+Found Claude Desktop's settings folder:
+  /path/to/Claude
+Write the connection into it for you? (Y/n)
 ```
 
-That error means Claude hasn't been installed or hasn't been opened yet — not that
-you typed it wrong. Download it from [claude.ai/download](https://claude.ai/download),
-open it, sign in, then come back here.
+**Say yes.** It finds the settings file wherever your version of Claude keeps it,
+backs up what's there, adds the connection with your API key already filled in,
+and leaves any other tools you've connected untouched.
 
-Now open the Claude settings file:
+If it says *"Setup complete"*, you're done here — skip to
+[Did it work?](#did-it-work) and restart Claude.
+
+If it couldn't find Claude Desktop, it says so and lists where it looked. Install
+Claude, open it once, then re-run `uv run python setup_wizard.py` — it'll finish
+the job.
+
+### The manual way
+
+Only needed if you declined above, or the wizard couldn't write the file.
+
+Open `claude_desktop_config.json` in this folder:
 
 - **Mac** — in Finder press `Cmd + Shift + G`, paste
-  `~/Library/Application Support/Claude/`, press Enter. Open
-  `claude_desktop_config.json` in TextEdit.
-- **Windows** — press `Win + R`, type `%APPDATA%\Claude`, press Enter. Open
-  `claude_desktop_config.json` in Notepad.
+  `~/Library/Application Support/Claude/`, press Enter. Edit in TextEdit.
+- **Windows** — there are **two possible locations**, depending on how Claude was
+  installed. Press `Win + R` and try each:
+  - `%APPDATA%\Claude` — if you installed the `.exe` from the website
+  - `%LOCALAPPDATA%\Packages` — if you installed from the **Microsoft Store**.
+    Inside, open the folder starting `Claude_…`, then
+    `LocalCache\Roaming\Claude`. The full path looks like
+    `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`,
+    where those random-looking letters differ on every machine.
 
-Claude Desktop can also open this file for you — look for **Settings → Developer
-→ Edit Config**. If your version has it, use it: it creates the file if it doesn't
-exist yet, which saves a step.
+  If `%APPDATA%\Claude` gives you *"Windows cannot find…"*, you have the Store
+  version — use the second path. Edit in Notepad.
 
-**If the folder opens but there's no `claude_desktop_config.json` in it,** you need
-to create it. That's normal — Claude doesn't always make it upfront.
+The block the wizard printed **already has your API key in it** — there's nothing
+to find and replace. Copy the whole thing.
 
-- **Windows** — in Notepad, paste your block, then **File → Save As**, set
-  *Save as type* to **All Files**, and name it exactly
-  `claude_desktop_config.json`. If you leave the type as *Text Documents*, Notepad
-  silently saves it as `claude_desktop_config.json.txt` and Claude will never read
-  it. This is the single most common Windows mistake here.
-- **Mac** — in TextEdit, choose **Format → Make Plain Text** first, then save it
-  as `claude_desktop_config.json` in that folder.
+**If the file is empty or missing,** paste the block in as-is and save.
 
-Paste in the block the setup wizard printed, and replace
-`PASTE_YOUR_API_KEY_HERE` with your actual key. Save.
+**If the file already has content,** don't replace it — you'd disconnect your other
+tools. You're adding the `"housecallpro"` entry *inside* the existing
+`"mcpServers"` object. Like this:
 
-> If that file already has text in it, don't replace everything — you'd disconnect
-> your other tools. Ask Claude for help merging it; paste both blocks and it'll
-> show you the combined version.
+```json
+{
+  "mcpServers": {
+    "some-other-tool": { "command": "..." },
+
+    "housecallpro": {
+      "command": "uv",
+      "args": ["run", "--project", "/your/path", "python", "/your/path/housecallpro_LHSTL.py"],
+      "env": { "HOUSECALL_PRO_API_KEY": "your-key-is-already-here" }
+    }
+  }
+}
+```
+
+Note the comma after the previous entry's `}`, and that there's only ever **one**
+`"mcpServers"`. If you're unsure, paste the whole file to Claude and ask it to
+merge the block in for you — it'll hand back the corrected file.
+
+> **Windows: saving the file.** In Notepad use **File → Save As**, set *Save as
+> type* to **All Files**, and name it exactly `claude_desktop_config.json`. Left as
+> *Text Documents*, Notepad silently saves `claude_desktop_config.json.txt` and
+> Claude will never read it. On Mac, choose **Format → Make Plain Text** first.
 
 Finally, **quit Claude completely and reopen it.** Closing the window is not
 enough — Claude keeps running in the background, and it only picks up the new
@@ -366,9 +401,16 @@ quarter.
 ## When something goes wrong
 
 **"Windows cannot find 'C:\Users\...\AppData\Roaming\Claude'"**
-Claude Desktop either isn't installed, or has never been opened. That folder is
-created the first time Claude runs. Install it, open it, sign in, then try again.
-The Mac equivalent is `~/Library/Application Support/Claude/` not existing.
+Two possible causes, and the first is more likely:
+
+1. **You installed Claude from the Microsoft Store.** Store apps are sandboxed, so
+   that path is redirected. Go to `%LOCALAPPDATA%\Packages`, open the folder
+   starting `Claude_…`, then `LocalCache\Roaming\Claude`.
+2. **Claude has never been opened.** The folder is created on first run. Install
+   it, open it, sign in.
+
+Easiest fix either way: re-run `uv run python setup_wizard.py` and let it write the
+file — it checks both locations for you.
 
 **I saved the settings file but Claude still doesn't see the tools (Windows)**
 Check the filename. In File Explorer turn on **View → File name extensions**. If

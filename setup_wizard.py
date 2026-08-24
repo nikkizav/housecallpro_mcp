@@ -27,7 +27,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -260,18 +262,122 @@ def build_config(found: dict, team: list[dict], sched: dict, tz: str) -> dict:
     }
 
 
-def desktop_block(api_key_placeholder: str) -> str:
+def uv_command() -> str:
+    """Absolute path to uv when we can find it, else the bare name.
+
+    Claude Desktop launches servers without a login shell, so it often does not
+    see PATH additions from .zshrc or the Windows user PATH. A bare "uv" then
+    fails with ENOENT even though it works fine in a terminal.
+    """
+    found = shutil.which("uv")
+    if found:
+        return found
+    for cand in (Path.home() / ".local" / "bin" / "uv",
+                 Path.home() / ".cargo" / "bin" / "uv",
+                 Path("/opt/homebrew/bin/uv"),
+                 Path("/usr/local/bin/uv")):
+        if cand.is_file():
+            return str(cand)
+    return "uv"
+
+
+def server_entry(api_key: str) -> dict:
+    """The one mcpServers entry this project needs."""
     main = (HERE / "housecallpro_LHSTL.py").resolve()
-    return json.dumps({
-        "mcpServers": {
-            "housecallpro": {
-                "command": "uv",
-                "args": ["run", "--project", str(HERE.resolve()),
-                         "python", str(main)],
-                "env": {"HOUSECALL_PRO_API_KEY": api_key_placeholder},
-            }
-        }
-    }, indent=2)
+    return {
+        "command": uv_command(),
+        "args": ["run", "--project", str(HERE.resolve()), "python", str(main)],
+        "env": {"HOUSECALL_PRO_API_KEY": api_key},
+    }
+
+
+def desktop_block(api_key: str) -> str:
+    return json.dumps({"mcpServers": {"housecallpro": server_entry(api_key)}},
+                      indent=2)
+
+
+def claude_config_dirs() -> list[Path]:
+    """Every location Claude Desktop is known to keep claude_desktop_config.json.
+
+    Windows has two, and which one you get depends on how Claude was installed:
+      - the .exe installer writes to %APPDATA%\\Claude
+      - the Microsoft Store (MSIX) build is sandboxed, so the same path is
+        redirected to
+        %LOCALAPPDATA%\\Packages\\Claude_<id>\\LocalCache\\Roaming\\Claude
+    The package id differs per machine, hence the glob.
+    """
+    home = Path.home()
+    out: list[Path] = []
+    if sys.platform == "darwin":
+        out.append(home / "Library" / "Application Support" / "Claude")
+    elif os.name == "nt":
+        if appdata := os.environ.get("APPDATA"):
+            out.append(Path(appdata) / "Claude")
+        if local := os.environ.get("LOCALAPPDATA"):
+            out.extend(sorted(
+                (Path(local) / "Packages").glob("Claude_*/LocalCache/Roaming/Claude")
+            ))
+    else:
+        out.append(home / ".config" / "Claude")
+    return out
+
+
+def choose_dir(cands: list[Path]) -> Path | None:
+    """Prefer a folder that already holds the config, then any that exists."""
+    for d in cands:
+        if (d / "claude_desktop_config.json").is_file():
+            return d
+    for d in cands:
+        if d.is_dir():
+            return d
+    return None
+
+
+def pick_claude_dir() -> tuple[Path | None, list[Path]]:
+    """(best directory to write into, every candidate we looked at)."""
+    cands = claude_config_dirs()
+    return choose_dir(cands), cands
+
+
+def install_into_claude(cfg_dir: Path, api_key: str) -> tuple[bool, str]:
+    """Merge our server into claude_desktop_config.json, backing up what's there.
+
+    Merging matters: the file usually holds other MCP servers, and replacing it
+    wholesale would disconnect them.
+    """
+    path = cfg_dir / "claude_desktop_config.json"
+    existing: dict = {}
+    note = ""
+    if path.is_file():
+        raw = path.read_text(encoding="utf-8-sig").strip()
+        if raw:
+            try:
+                existing = json.loads(raw)
+            except json.JSONDecodeError as e:
+                return False, (f"{path} exists but is not valid JSON ({e}). "
+                               f"Fix or rename it, then re-run this wizard.")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            backup = path.parent / f"claude_desktop_config.backup-{stamp}.json"
+            backup.write_text(raw, encoding="utf-8")
+            note = f"  previous file backed up to: {backup.name}\n"
+    if not isinstance(existing, dict):
+        return False, f"{path} does not contain a JSON object."
+
+    servers = existing.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    replaced = "housecallpro" in servers
+    servers["housecallpro"] = server_entry(api_key)
+    existing["mcpServers"] = servers
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    others = [k for k in servers if k != "housecallpro"]
+    return True, (
+        f"{note}  wrote: {path}\n"
+        f"  {'updated' if replaced else 'added'} the 'housecallpro' entry"
+        + (f", kept {len(others)} other server(s) untouched" if others else "")
+    )
 
 
 async def main() -> int:
@@ -355,17 +461,68 @@ async def main() -> int:
     print(f"  pipeline stages: {len(cfg['job_pipeline_stages'])}")
     print(f"  cost per hour  : ${sched['blended_cost_per_tech_hour']:,.2f}")
 
+    # ── connect it to Claude Desktop ─────────────────────────────────────────
+    # Hand-editing this JSON is the single biggest failure point in setup, so
+    # offer to do it. The key is already in hand, which also removes the "where
+    # do I paste the API key" step entirely.
     print("\n" + "─" * 66)
-    print("Add this to your Claude Desktop config, inside \"mcpServers\":")
-    print("  macOS   ~/Library/Application Support/Claude/claude_desktop_config.json")
-    print("  Windows %APPDATA%\\Claude\\claude_desktop_config.json")
+    print("Connecting it to Claude Desktop")
     print("─" * 66)
-    print(desktop_block("PASTE_YOUR_API_KEY_HERE"))
+
+    cfg_dir, candidates = pick_claude_dir()
+    if cfg_dir:
+        target = cfg_dir / "claude_desktop_config.json"
+        print(f"Found Claude Desktop's settings folder:\n  {cfg_dir}")
+        if target.is_file():
+            print(f"  ({target.name} already exists — your other MCP servers, if any,")
+            print("   will be kept, and the current file backed up first.)")
+        if ask_yes("\nWrite the connection into it for you?", default=True):
+            ok, msg = install_into_claude(cfg_dir, key)
+            print()
+            if ok:
+                print(msg)
+                print("\n" + "=" * 66)
+                print("  Setup complete.")
+                print("=" * 66)
+                print("Now QUIT Claude Desktop completely and reopen it:")
+                print("  Mac      Cmd+Q  (closing the window is not enough)")
+                print("  Windows  right-click the Claude icon in the system tray")
+                print("           (bottom-right, maybe behind the ^ arrow) > Quit")
+                print("\nThen ask Claude:  run hcp_check_setup")
+                return 0
+            print(f"Couldn't write it automatically: {msg}")
+            print("Falling back to the manual steps below.\n")
+    else:
+        print("Couldn't find Claude Desktop's settings folder. That usually means")
+        print("Claude Desktop isn't installed yet, or has never been opened —")
+        print("the folder is created the first time it runs.")
+        print("Install it from https://claude.ai/download, open it once, then")
+        print("re-run this wizard and it will finish the job.\n")
+        print("Looked in:")
+        for c in candidates:
+            print(f"  {c}")
+
+    # ── manual fallback ──────────────────────────────────────────────────────
+    print("\n" + "─" * 66)
+    print("To do it by hand, open claude_desktop_config.json in:")
+    if sys.platform == "darwin":
+        print("  ~/Library/Application Support/Claude/")
+    elif os.name == "nt":
+        print("  %APPDATA%\\Claude\\                        (.exe install)")
+        print("  %LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\")
+        print("                                            (Microsoft Store install)")
+    else:
+        print("  ~/.config/Claude/")
+    print("\nand add the \"housecallpro\" block below INSIDE the existing")
+    print("\"mcpServers\" object. Do not add a second \"mcpServers\" key.")
+    print("The API key is already filled in for you.")
     print("─" * 66)
-    print("Then restart Claude Desktop completely (quit, not just close the")
-    print("window) and ask Claude:  run hcp_check_setup")
-    print("\nconfig.json holds no secrets and is gitignored by default; your API")
-    print("key lives only in the Claude Desktop config.")
+    print(desktop_block(key))
+    print("─" * 66)
+    print("Then quit Claude Desktop completely, reopen it, and ask Claude:")
+    print("  run hcp_check_setup")
+    print("\nconfig.json holds no secrets and is gitignored; your API key lives")
+    print("only in the Claude Desktop config.")
     return 0
 
 
