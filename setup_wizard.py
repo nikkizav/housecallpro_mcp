@@ -432,12 +432,38 @@ async def main() -> int:
                   f"{', '.join(f'${c:,.0f}' for c in sorted(set(costs)))} /hr cost")
             print("Your blended cost should ALSO include vehicle, insurance and")
             print("overhead — it is usually higher than the price-book rate.")
+    # These two numbers interact: the GAP between them is the unpaid break the
+    # time model deducts from every full day. Asked separately, nobody notices —
+    # one tester set 7.25 productive against an 8.5 window and silently got a
+    # 75-minute deduction on every day. So show the result and let them confirm.
+    print("\nThese next two work together. The difference between them is the")
+    print("unpaid break subtracted from any day of 6 hours or more.")
+    while True:
+        productive = ask_float("Productive hours per tech per day",
+                               DEFAULTS["productive_hours_per_day"])
+        window = ask_float("Booked appointment window per day (incl. break)",
+                           DEFAULTS["appointment_window_hours"])
+        gap = window - productive
+        print()
+        if gap < 0:
+            print(f"  ⚠ The window ({window}h) is SHORTER than productive hours "
+                  f"({productive}h).")
+            print("    That would add time rather than subtract it. Try again.")
+            continue
+        print(f"  → {window}h booked − {productive}h productive "
+              f"= a {gap * 60:.0f}-minute break deducted from every full day.")
+        if gap > 0.75:
+            print(f"    That is a long break. If your crews take ~30 minutes, set")
+            print(f"    productive to {window - 0.5:g} instead.")
+        elif gap == 0:
+            print("    No break deducted — full booked window counts as worked time.")
+        if ask_yes("  Is that right?", default=True):
+            break
+        print()
+
     sched = {
-        "productive_hours_per_day": ask_float(
-            "Productive hours per tech per day", DEFAULTS["productive_hours_per_day"]),
-        "appointment_window_hours": ask_float(
-            "Booked appointment window per day (incl. break)",
-            DEFAULTS["appointment_window_hours"]),
+        "productive_hours_per_day": productive,
+        "appointment_window_hours": window,
         "blended_cost_per_tech_hour": ask_float(
             "Fully-loaded cost per tech-hour ($)", default_cost),
         "capacity_target_hours_per_day": ask_float(

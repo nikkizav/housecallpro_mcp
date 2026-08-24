@@ -112,6 +112,34 @@ them, the same way you'd read something before signing it.
 There is deliberately no bulk-delete tool. Some things shouldn't be one sentence
 away.
 
+**What's this pop-up asking me to Deny / Allow once / Allow for this task?**
+
+That's Claude checking with you before it touches your Housecall Pro data. Normal,
+and a good thing.
+
+Pick **Allow for this task** for anything you asked for. The analysis tools make a
+lot of separate lookups — a month's time variance can be two hundred — so on
+*Allow once* you'll be clicking approve until you give up.
+
+The pop-up names the tool, and the name tells you what it does. Anything starting
+`hcp_list_` or `hcp_get_`, plus `hcp_time_variance` and `hcp_post_job_analysis`,
+only reads. That's 27 of the 43 tools. The 16 that can change something start with
+`create`, `update`, `delete`, `add`, `remove`, `set`, `write`, `finalize` or
+`approve` — worth actually reading before you allow.
+
+If you asked a question and it wants to *change* something, hit Deny and ask what
+it's trying to do. Denying never breaks anything; it stops that one action.
+
+**Do I have to run `hcp_check_setup` every time?**
+
+No. It's a one-time check to confirm the install worked. Come back to it only if
+results look empty or obviously wrong.
+
+If you're re-explaining your business at the start of every chat, that's what a
+**Project** is for — see the README section on setting one up. Put your team size,
+your cost per hour and how you book days in the project instructions once, and
+every chat in that Project starts already knowing.
+
 **Should I let my office manager use it?**
 
 That's your call, and it's the same call as giving someone Housecall Pro admin

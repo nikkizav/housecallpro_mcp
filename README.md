@@ -46,6 +46,8 @@ to think about it again.
 - [Before you start](#before-you-start)
 - [Setup](#setup) — 15 minutes, five steps
 - [Did it work?](#did-it-work)
+- [The permission pop-ups](#the-permission-pop-ups) — Deny / Allow once / Allow for this task
+- [Set up a Project](#set-up-a-project-so-you-dont-repeat-yourself)
 - [What to ask](#what-to-ask)
 - [Reading the numbers](#reading-the-numbers) ← **the important section**
 - [When something goes wrong](#when-something-goes-wrong)
@@ -319,6 +321,85 @@ You should see:
 
 If anything shows ✗, it tells you exactly what's wrong and what to do. Run it again
 any time results look empty or wrong.
+
+---
+
+## The permission pop-ups
+
+The first time Claude uses this connector it stops and asks, with three choices —
+usually **Deny**, **Allow once**, and **Allow for this task**. This is Claude
+checking with you before touching your business data. Here's how to think about it.
+
+| Choice | What happens | When to pick it |
+|---|---|---|
+| **Allow for this task** | Stops asking for the rest of this piece of work | Almost always. This is the normal answer. |
+| **Allow once** | Runs this one call, then asks again | You want to see each step, or you're not sure yet |
+| **Deny** | Blocks it. Claude tells you what it couldn't do | Something looks wrong, or you didn't expect it |
+
+**Why "Allow for this task" matters practically:** the analysis tools make a lot of
+calls. A time variance over a month pulls details for every job in it — that can be
+two hundred separate lookups. On **Allow once** you'll be clicking approve until
+you give up. Pick **Allow for this task** and it runs.
+
+### Reading the prompt
+
+The pop-up names the tool it wants to run, and the name tells you what it does:
+
+- **`hcp_list_…`, `hcp_get_…`, `hcp_time_variance`, `hcp_post_job_analysis`** —
+  these only look things up. 27 of the 43 tools are read-only. Nothing you approve
+  here can change anything.
+- **`hcp_create_…`, `hcp_update_…`, `hcp_delete_…`, `hcp_add_…`, `hcp_remove_…`,
+  `hcp_set_…`, `hcp_write_estimate`, `hcp_finalize_estimate`,
+  `hcp_approve_estimate_option`** — these **change your Housecall Pro data**. There
+  are 16 of them. Read what it says before allowing.
+
+If you asked a question and it wants to *change* something, that's worth a second
+look — say Deny and ask what it's trying to do.
+
+Denying never breaks anything. It just stops that one action.
+
+---
+
+## Set up a Project so you don't repeat yourself
+
+**First, a clarification:** `hcp_check_setup` is a **one-time check**. You run it
+once after installing to confirm everything's wired up. You do *not* run it at the
+start of every conversation. Only come back to it if results look empty or wrong.
+
+The connection itself is set up once, at the app level. It's available in every
+chat from then on — nothing to reconnect.
+
+What *doesn't* carry between chats is **context about your business** — your team,
+how you quote, what you care about. A **Project** fixes that.
+
+### Creating one
+
+In Claude, go to **Projects → New project** (in Cowork, the Projects section in the
+left sidebar). Name it something like *Housecall Pro*.
+
+Then add **project instructions** — this is the part that saves you time. Something
+like:
+
+```
+I run [your company], a home services business in [your city].
+We have [N] field techs and [N] apprentice(s).
+Our fully loaded cost is $[X] per tech-hour.
+We book [8.5]-hour days on the calendar.
+
+You have a connection to our Housecall Pro account. Use it to answer
+questions about our jobs, schedule, estimates and invoices.
+
+When you report hours, always tell me the confidence grade and judge
+quote accuracy from the MEASURED jobs only.
+
+Check numbers before presenting them. Tell me when you're not sure.
+```
+
+Now every chat in that Project starts knowing who you are. You ask "how did last
+week go?" instead of re-explaining your company first.
+
+You can also drop the `WHY_THIS_HELPS.md` and `README.md` files into the Project so
+Claude knows how the tool works and what its limits are.
 
 ---
 
