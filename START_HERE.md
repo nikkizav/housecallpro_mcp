@@ -119,8 +119,10 @@ do. This answers the questions those reports were never built for.
 | **Your crew** | Nothing changes for them. |
 
 *Not with Local Handyman? Confirm you have API access before you start: in
-Housecall Pro go to **Settings → Integrations → API**. No API section means
-you're on a plan below MAX and this won't work yet.*
+Housecall Pro click the **My Apps** tile on the top bar (the nine-squares icon next
+to Settings), then **Go to App Store**, and search for **API**.
+No **API Key Management** tile means you're on a plan below MAX and this won't
+work yet.*
 
 ---
 

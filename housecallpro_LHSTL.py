@@ -3961,8 +3961,12 @@ async def hcp_check_setup() -> str:
             problems.append(f"API call failed: {err}")
             lines.append(f"║  ✗ API key / connectivity — {err}")
             if "401" in err or "403" in err:
-                advice.append("Check HOUSECALL_PRO_API_KEY. Housecall Pro > "
-                              "Settings > Integrations > API (needs the MAX plan).")
+                advice.append(
+                    "Check HOUSECALL_PRO_API_KEY. Generate a fresh key in Housecall "
+                    "Pro: My Apps (nine-squares icon by Settings) > Go to App Store "
+                    "> search 'API' > API Key Management > Generate a new API key. "
+                    "Needs the MAX plan."
+                )
             elif "429" in err:
                 advice.append("Rate limited right now — wait a minute and re-run.")
         else:

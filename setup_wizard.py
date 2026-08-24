@@ -111,8 +111,11 @@ async def discover(api_key: str) -> dict | None:
         if err:
             print(f"  ✗ {err}")
             if "401" in err or "403" in err:
-                print("    The key was rejected. Copy it again from Housecall Pro >")
-                print("    Settings > Integrations > API. API access needs the MAX plan.")
+                print("    The key was rejected. Generate a fresh one in Housecall Pro:")
+                print("      My Apps (nine-squares icon, top bar, next to Settings)")
+                print("      > Go to App Store > search 'API' > API Key Management")
+                print("      > Generate a new API key")
+                print("    API access requires the MAX plan.")
             return None
         name = (company or {}).get("name") or (company or {}).get("company_name") or "?"
         print(f"  ✓ Connected to: {name}")
@@ -289,7 +292,12 @@ async def main() -> int:
         if not ask_yes("Use this key?", default=True):
             key = ""
     if not key:
-        print("\nFind your key: Housecall Pro > Settings > Integrations > API")
+        print("\nFind your key in Housecall Pro:")
+        print("  1. Top bar > My Apps tile (nine small squares, next to Settings)")
+        print("  2. Go to App Store")
+        print("  3. Search for 'API'")
+        print("  4. API Key Management tile")
+        print("  5. Generate a new API key - name it 'Claude'")
         print("(API access requires the MAX plan.)")
         key = ask("API key")
     if not key:

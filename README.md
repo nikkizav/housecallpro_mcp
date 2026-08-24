@@ -64,7 +64,7 @@ to think about it again.
 
 | You need | Notes |
 |---|---|
-| **Housecall Pro API access** | Comes with the MAX plan. Local Handyman owners are all on MAX, so there's nothing to check. Outside that network: look under Settings → Integrations → API, and if there's no API section you're on a lower plan and this won't work yet. |
+| **Housecall Pro API access** | Comes with the MAX plan. Local Handyman owners are all on MAX, so there's nothing to check. Outside that network: open **My Apps → Go to App Store** and search for **API**. If there's no **API Key Management** tile, you're on a lower plan and this won't work yet. |
 | **Claude desktop app** | Free to download at [claude.ai/download](https://claude.ai/download). Sign in with your Claude account. |
 | **About 15 minutes** | Mostly waiting on downloads. |
 
@@ -78,11 +78,23 @@ press Enter.
 
 ### Step 1 — Get your Housecall Pro key
 
-In Housecall Pro: **Settings → Integrations → API → create a key**, then copy it.
+In Housecall Pro:
+
+1. On the top bar, click the **My Apps** tile — the icon made of nine small
+   squares, sitting next to Settings
+2. Click the **Go to App Store** button
+3. Search for **API**
+4. Open the **API Key Management** tile
+5. Click the **Generate a new API key** tile, and name it something you'll
+   recognise later — `Claude` works
+6. Copy the key it gives you
 
 This key is how your computer proves it's allowed to read your account. **Treat it
 like your password.** Don't email it or paste it into a group chat. Later steps
 put it in a settings file on your own machine and nowhere else.
+
+> Copy the key now if it's shown to you. Most systems only display a new key once,
+> and if you lose it you just generate another.
 
 ### Step 2 — Open the command window
 
@@ -301,8 +313,9 @@ settings file probably has a typo; one misplaced comma disables everything. Past
 the file to Claude and ask it to check.
 
 **"HTTP 401" or "403"**
-Your key is wrong, was deleted, or your plan doesn't include API access. Make a new one in
-Settings → Integrations → API.
+Your key is wrong, was deleted, or your plan doesn't include API access. Generate a
+fresh one: **My Apps → Go to App Store → search "API" → API Key Management →
+Generate a new API key**, then update it in the Claude settings file from Step 5.
 
 **"HTTP 429" or fewer jobs than expected**
 Housecall Pro is limiting how fast we can ask. It retries automatically, and if it

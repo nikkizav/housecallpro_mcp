@@ -17,7 +17,9 @@
     "     is not enough.",
     "  5. Then ask Claude: run hcp_check_setup",
     "",
-    "Your API key: Housecall Pro > Settings > Integrations > API (requires MAX plan).",
+    "Your API key, in Housecall Pro: My Apps tile (nine small squares on the top bar,",
+    "next to Settings) > Go to App Store > search 'API' > API Key Management >",
+    "Generate a new API key. Requires the MAX plan.",
     "Delete this _README key if you like; Claude Desktop ignores unknown top-level keys."
   ],
 

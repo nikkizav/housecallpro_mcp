@@ -162,9 +162,10 @@ tier. Heavy daily use is more comfortable on a paid plan.
 No. It runs on Housecall Pro's API, which comes with MAX, and every Local Handyman
 owner is on MAX already. Nothing to buy and nothing to change.
 
-*If you're outside the Local Handyman network:* confirm you have API access first,
-under **Settings → Integrations → API**. No API section means you're on a plan
-below MAX and this won't work yet.
+*If you're outside the Local Handyman network:* confirm you have API access first.
+Click the **My Apps** tile on the top bar — the nine-squares icon next to Settings
+— then **Go to App Store**, and search for **API**. No **API Key Management** tile
+means you're on a plan below MAX and this won't work yet.
 
 **How long does setup take?**
 
