@@ -65,7 +65,7 @@ to think about it again.
 | You need | Notes |
 |---|---|
 | **Housecall Pro API access** | Comes with the MAX plan. Local Handyman owners are all on MAX, so there's nothing to check. Outside that network: open **My Apps → Go to App Store** and search for **API**. If there's no **API Key Management** tile, you're on a lower plan and this won't work yet. |
-| **Claude desktop app** | Free to download at [claude.ai/download](https://claude.ai/download). Sign in with your Claude account. |
+| **Claude desktop app** | Free to download at [claude.ai/download](https://claude.ai/download). **Install it and open it once before you start** — Claude creates the settings folder you'll need in Step 5 the first time it runs. Sign in with your Claude account. |
 | **About 15 minutes** | Mostly waiting on downloads. |
 
 You do **not** need to know how to program. You'll copy and paste a few commands
@@ -104,7 +104,19 @@ own name for it:
 - **Mac** — press `Cmd + Space`, type `Terminal`, press Enter.
 - **Windows** — press the `Windows` key, type `PowerShell`, press Enter.
 
-A window with a blinking cursor opens. That's all it is.
+**There will already be some text in the window. That's normal.** Windows shows a
+couple of lines about Microsoft, and Mac may show when you last logged in. Below
+it is a line ending in `>` (Windows) or `%` (Mac) — that's the prompt, and it's
+where what you type appears. Windows looks roughly like this:
+
+```
+Windows PowerShell
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+PS C:\Users\yourname>
+```
+
+Ignore the existing text. You just type after the prompt and press Enter.
 
 > From here on this guide says **"Terminal"** to mean *Terminal on Mac,
 > PowerShell on Windows*. Everything else is the same on both.
@@ -137,18 +149,38 @@ and reopen Terminal once more.
 ### Step 4 — Download and set up
 
 Download this project: click the green **Code** button at the top of this page →
-**Download ZIP**. Unzip it, and move the folder somewhere you'll find again — your
-Documents folder is fine.
+**Download ZIP**. Unzip it, and move the resulting folder somewhere you'll find
+again — your Documents folder is fine.
+
+**Two things that trip people up here:**
+
+The folder will be named something like `housecallpro_mcp-main`. Renaming it to
+something short — `HCP_MCP` works well — makes the next command much easier to
+type. Do that now if you like.
+
+Unzipping often creates **a folder inside a folder**, both with the same name. You
+need the *inner* one — the folder that directly contains `setup_wizard.py` and
+`README.md`. Open it and look; if all you see is another folder with the same
+name, go one level deeper.
 
 Now point Terminal at that folder. Type `cd ` — the letters c, d, then a space —
-and then drag the folder itself into the Terminal window. That pastes its location
-for you, so you never have to type it out. Press Enter.
+then drag **that** folder (the one holding the files) into the Terminal window.
+Dragging pastes its location for you, so you never type it out. Press Enter.
 
 - **Mac** — drag the folder from **Finder**
 - **Windows** — drag the folder from **File Explorer**
 
 If dragging doesn't paste anything, type `cd ` and then the full folder location by
 hand (on Windows it starts with `C:\`).
+
+**Check you're in the right place** before going on. Type this and press Enter:
+
+- **Mac** — `ls`
+- **Windows** — `dir`
+
+You should see `setup_wizard.py` and `README.md` in the list. If instead you see a
+single folder name, you're one level too high — run `cd ` followed by that folder
+name, and check again.
 
 Then run the setup:
 
@@ -174,13 +206,40 @@ open** — you need it next.
 
 ### Step 5 — Connect it to Claude
 
-Open the Claude settings file:
+**First: install the Claude desktop app and open it at least once.** This matters
+more than it sounds. The folder you're about to look for doesn't exist until
+Claude has run once and created it. If you skip this, you'll get:
+
+```
+Windows cannot find 'C:\Users\yourname\AppData\Roaming\Claude'
+```
+
+That error means Claude hasn't been installed or hasn't been opened yet — not that
+you typed it wrong. Download it from [claude.ai/download](https://claude.ai/download),
+open it, sign in, then come back here.
+
+Now open the Claude settings file:
 
 - **Mac** — in Finder press `Cmd + Shift + G`, paste
   `~/Library/Application Support/Claude/`, press Enter. Open
   `claude_desktop_config.json` in TextEdit.
 - **Windows** — press `Win + R`, type `%APPDATA%\Claude`, press Enter. Open
   `claude_desktop_config.json` in Notepad.
+
+Claude Desktop can also open this file for you — look for **Settings → Developer
+→ Edit Config**. If your version has it, use it: it creates the file if it doesn't
+exist yet, which saves a step.
+
+**If the folder opens but there's no `claude_desktop_config.json` in it,** you need
+to create it. That's normal — Claude doesn't always make it upfront.
+
+- **Windows** — in Notepad, paste your block, then **File → Save As**, set
+  *Save as type* to **All Files**, and name it exactly
+  `claude_desktop_config.json`. If you leave the type as *Text Documents*, Notepad
+  silently saves it as `claude_desktop_config.json.txt` and Claude will never read
+  it. This is the single most common Windows mistake here.
+- **Mac** — in TextEdit, choose **Format → Make Plain Text** first, then save it
+  as `claude_desktop_config.json` in that folder.
 
 Paste in the block the setup wizard printed, and replace
 `PASTE_YOUR_API_KEY_HERE` with your actual key. Save.
@@ -305,6 +364,21 @@ quarter.
 ---
 
 ## When something goes wrong
+
+**"Windows cannot find 'C:\Users\...\AppData\Roaming\Claude'"**
+Claude Desktop either isn't installed, or has never been opened. That folder is
+created the first time Claude runs. Install it, open it, sign in, then try again.
+The Mac equivalent is `~/Library/Application Support/Claude/` not existing.
+
+**I saved the settings file but Claude still doesn't see the tools (Windows)**
+Check the filename. In File Explorer turn on **View → File name extensions**. If
+it reads `claude_desktop_config.json.txt`, Notepad added the `.txt` — rename it to
+remove that, then fully quit and reopen Claude.
+
+**`cd` says "cannot find the path" or the setup script isn't found**
+You're probably one folder too high. Unzipping usually makes a folder inside a
+folder. Run `dir` (Windows) or `ls` (Mac): you should see `setup_wizard.py`. If you
+only see another folder name, `cd` into it and try again.
 
 **Claude doesn't seem to know about my jobs**
 Quit Claude completely and reopen — `Cmd + Q` on Mac, or right-click the tray icon
