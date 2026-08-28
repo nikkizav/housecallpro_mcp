@@ -1,20 +1,20 @@
 {
   "_README": [
     "Template for the Claude Desktop MCP config. `setup_wizard.py` prints this block",
-    "already filled in with the correct absolute paths for your machine — prefer that.",
+    "already filled in with the correct absolute paths for your machine \u2014 prefer that.",
     "",
-    "Where this file goes (this is NOT the file you edit — copy the mcpServers entry into it):",
+    "Where this file goes (this is NOT the file you edit \u2014 copy the mcpServers entry into it):",
     "  macOS    ~/Library/Application Support/Claude/claude_desktop_config.json",
     "  Windows, .exe install:  %APPDATA%\\Claude\\claude_desktop_config.json",
     "  Windows, Microsoft Store install (sandboxed, path is redirected):",
     "    %LOCALAPPDATA%\\Packages\\Claude_<random>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json",
-    "  Not sure which? Run setup_wizard.py — it checks both and writes the file for you.",
+    "  Not sure which? Run setup_wizard.py \u2014 it checks both and writes the file for you.",
     "",
     "Rules that trip people up:",
     "  1. Paths must be ABSOLUTE. No ~ and no relative paths.",
     "  2. If the file already has an \"mcpServers\" object, add \"housecallpro\" INSIDE it",
     "     rather than pasting a second mcpServers key.",
-    "  3. Strict JSON — no comments, no trailing commas. One stray comma disables",
+    "  3. Strict JSON \u2014 no comments, no trailing commas. One stray comma disables",
     "     every MCP server silently.",
     "  4. Fully quit Claude Desktop (Cmd+Q on macOS) and reopen. Closing the window",
     "     is not enough.",
@@ -23,9 +23,12 @@
     "Your API key, in Housecall Pro: My Apps tile (nine small squares on the top bar,",
     "next to Settings) > Go to App Store > search 'API' > API Key Management >",
     "Generate a new API key. Requires the MAX plan.",
-    "Delete this _README key if you like; Claude Desktop ignores unknown top-level keys."
+    "Delete this _README key if you like; Claude Desktop ignores unknown top-level keys.",
+    "",
+    "There is only ONE server to register: housecallpro. Earlier versions had 20",
+    "per-domain servers; they were removed, and everything they could do now lives",
+    "in the main server."
   ],
-
   "mcpServers": {
     "housecallpro": {
       "command": "uv",
@@ -35,26 +38,6 @@
         "/ABSOLUTE/PATH/TO/housecallpro_mcp",
         "python",
         "/ABSOLUTE/PATH/TO/housecallpro_mcp/housecallpro_LHSTL.py"
-      ],
-      "env": {
-        "HOUSECALL_PRO_API_KEY": "PASTE_YOUR_API_KEY_HERE"
-      }
-    },
-
-    "_optional_raw_passthrough_example": {
-      "_note": [
-        "You do NOT need this. The main 'housecallpro' server above covers normal use",
-        "with readable output. Register a per-domain server only when you want raw",
-        "JSON for one area. Rename the key (e.g. 'housecall-pro-jobs') and point it at",
-        "the matching housecallpro_<domain>.py file."
-      ],
-      "command": "uv",
-      "args": [
-        "run",
-        "--project",
-        "/ABSOLUTE/PATH/TO/housecallpro_mcp",
-        "python",
-        "/ABSOLUTE/PATH/TO/housecallpro_mcp/housecallpro_jobs.py"
       ],
       "env": {
         "HOUSECALL_PRO_API_KEY": "PASTE_YOUR_API_KEY_HERE"

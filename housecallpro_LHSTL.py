@@ -135,6 +135,21 @@ def _as_int(val: Any, default: int) -> int:
         return default
 
 
+# ── Array query parameters ─────────────────────────────────────────────────────
+#
+# EVERY repeated query parameter must be sent with a [] suffix: work_status[],
+# status[], employee_ids[], payment_method[], customer_uuid[], expand[].
+# Without it the API misbehaves in three different ways, one of them silent:
+#     GET /jobs?work_status=completed        -> HTTP 400
+#     GET /invoices?status=open              -> HTTP 422
+#     GET /estimates?work_status=completed   -> HTTP 200 and IGNORES the filter,
+#                                               returning every estimate
+# That last one is the dangerous case - it looks like it worked. Verified
+# against a live account 2026-08-28.
+#
+# This applies to query strings only. JSON request BODIES take plain names
+# (e.g. dispatched_employee_ids on an appointment), so do not add [] there.
+
 def _as_list(val: Any) -> list[str] | None:
     if val is None:
         return None
@@ -769,12 +784,11 @@ async def hcp_list_jobs(
         if val:
             params[key] = val
     if statuses := _as_list(work_status):
-        params["work_status"] = statuses
+        params["work_status[]"] = statuses
     if emp_ids := _as_list(employee_ids):
-        params["employee_ids"] = emp_ids
+        params["employee_ids[]"] = emp_ids
     if expand_list := _as_list(expand):
-        # MUST be expand[] — the API returns HTTP 400 for a plain "expand" key,
-        # in both scalar and repeated form.
+        # MUST be expand[] — see the note on array params in _as_list.
         params["expand[]"] = expand_list
 
     data = await api_request("GET", "/jobs", params=params)
@@ -1207,11 +1221,11 @@ async def hcp_list_invoices(
         if val:
             params[key] = val
     if statuses := _as_list(status):
-        params["status"] = statuses
+        params["status[]"] = statuses
     if methods := _as_list(payment_method):
-        params["payment_method"] = methods
+        params["payment_method[]"] = methods
     if cuuids := _as_list(customer_uuid):
-        params["customer_uuid"] = cuuids
+        params["customer_uuid[]"] = cuuids
 
     data = await api_request("GET", "/invoices", params=params)
     invoices = data.get("invoices", [])
@@ -1320,9 +1334,9 @@ async def hcp_list_estimates(
         if val:
             params[key] = val
     if statuses := _as_list(work_status):
-        params["work_status"] = statuses
+        params["work_status[]"] = statuses
     if emp_ids := _as_list(employee_ids):
-        params["employee_ids"] = emp_ids
+        params["employee_ids[]"] = emp_ids
 
     data = await api_request("GET", "/estimates", params=params)
     estimates = data.get("estimates", [])

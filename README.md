@@ -570,10 +570,21 @@ Added or lost a tech? Re-run the setup wizard, then `hcp_check_setup`.
 
 Everything below is optional.
 
-**Architecture.** `housecallpro_LHSTL.py` is the main server: 45 tools returning
-formatted, readable output. The other 20 `housecallpro_<domain>.py` files are thin
-wrappers returning raw JSON — register one in your Claude config only if you want
-unformatted access to a specific area.
+**Architecture.** One server, `housecallpro_LHSTL.py`, with 55 tools returning
+formatted, readable output. There is nothing else to register.
+
+Earlier versions shipped 20 additional per-domain servers returning raw JSON.
+They were removed: most duplicated the main server, a number called endpoints that
+do not exist and could never have worked, and running 20 servers instead of one is
+what made Claude time out starting them. Everything they could genuinely do now
+lives in the main server — including leads, job line-item editing and customer
+addresses, which were the only real capability they had that it lacked.
+
+**Array query parameters need a `[]` suffix** — `work_status[]`, `status[]`,
+`employee_ids[]`, `expand[]`. Omitting it fails three different ways, and one is
+silent: `GET /estimates?work_status=completed` returns HTTP 200 and every estimate,
+filter ignored. `GET /jobs?work_status=…` returns 400 and `/invoices?status=…`
+returns 422. Worth knowing if you script against this API yourself.
 
 **How actual hours are computed.** Per day, not as one span:
 
