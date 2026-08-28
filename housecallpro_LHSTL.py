@@ -324,9 +324,15 @@ def _sched(schedule: dict | None) -> tuple[str | None, str | None, int | None]:
     arrival_window_minutes.  Accept either so callers do not have to care.
     """
     s = schedule or {}
+    # Prefer the local-time fields added 2026-08-20 (scheduled_start_local /
+    # scheduled_end_local, alongside an IANA time_zone). They carry a UTC offset
+    # so durations are identical, but the date and clock time are the ones the
+    # crew actually works — which is both what a user should see and the correct
+    # basis for bucketing work into days. UTC would put an evening job on the
+    # following day anywhere west of the meridian.
     return (
-        s.get("scheduled_start") or s.get("start_time"),
-        s.get("scheduled_end") or s.get("end_time"),
+        s.get("scheduled_start_local") or s.get("scheduled_start") or s.get("start_time"),
+        s.get("scheduled_end_local") or s.get("scheduled_end") or s.get("end_time"),
         s.get("arrival_window") if s.get("arrival_window") is not None
         else s.get("arrival_window_minutes"),
     )
@@ -767,7 +773,9 @@ async def hcp_list_jobs(
     if emp_ids := _as_list(employee_ids):
         params["employee_ids"] = emp_ids
     if expand_list := _as_list(expand):
-        params["expand"] = expand_list
+        # MUST be expand[] — the API returns HTTP 400 for a plain "expand" key,
+        # in both scalar and repeated form.
+        params["expand[]"] = expand_list
 
     data = await api_request("GET", "/jobs", params=params)
     jobs = data.get("jobs", [])
@@ -821,7 +829,9 @@ async def hcp_get_job(job_id: str, expand: Optional[str] = None) -> str:
     """
     params: dict = {}
     if expand_list := _as_list(expand):
-        params["expand"] = expand_list
+        # MUST be expand[] — the API returns HTTP 400 for a plain "expand" key,
+        # in both scalar and repeated form.
+        params["expand[]"] = expand_list
     data = await api_request("GET", f"/jobs/{job_id}", params=params)
 
     tags = data.get("tags", [])
@@ -3932,6 +3942,126 @@ async def hcp_time_variance(
         f"║    Middle days of a multi-day job are inference — no data exists.",
         f"╚{'═'*61}",
     ]
+    return "\n".join(lines)
+
+
+# ── Customer updates ───────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def hcp_update_customer(
+    customer_id: str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    email: Optional[str] = None,
+    company: Optional[str] = None,
+    mobile_number: Optional[str] = None,
+    home_number: Optional[str] = None,
+    work_number: Optional[str] = None,
+    lead_source: Optional[str] = None,
+    notes: Optional[str] = None,
+    tags: Optional[str] = None,
+    notifications_enabled: Optional[bool] = None,
+) -> str:
+    """
+    Update an existing customer profile.  Only the fields you pass are changed.
+
+    Useful for fixing a wrong phone number or email, and for backfilling
+    lead_source — that lives on the customer record and does not copy onto their
+    jobs or estimates, so it is the field most often left blank.
+
+    Args:
+        customer_id: Customer UUID (cus_...)
+        first_name: New first name
+        last_name: New last name
+        email: New email address
+        company: Company name
+        mobile_number: Mobile phone
+        home_number: Home phone
+        work_number: Work phone
+        lead_source: How they found you (see hcp_list_lead_sources)
+        notes: Customer-level notes — REPLACES existing notes, it does not append
+        tags: Comma-separated tags — REPLACES the existing tag list
+        notifications_enabled: Whether HCP may send them notifications
+    """
+    payload: dict[str, Any] = {}
+    for key, val in (
+        ("first_name", first_name), ("last_name", last_name), ("email", email),
+        ("company", company), ("mobile_number", mobile_number),
+        ("home_number", home_number), ("work_number", work_number),
+        ("lead_source", lead_source), ("notes", notes),
+    ):
+        if val is not None:
+            payload[key] = val
+    if tags is not None:
+        payload["tags"] = _as_list(tags)
+    if notifications_enabled is not None:
+        payload["notifications_enabled"] = bool(notifications_enabled)
+
+    if not payload:
+        return ("Nothing to update — pass at least one field.\n"
+                "Fields: first_name, last_name, email, company, mobile_number, "
+                "home_number, work_number, lead_source, notes, tags, "
+                "notifications_enabled")
+
+    before = await api_request("GET", f"/customers/{customer_id}")
+    data = await api_request("PUT", f"/customers/{customer_id}", json=payload)
+
+    lines = [f"✓ Updated customer {customer_id}",
+             f"  {data.get('first_name','')} {data.get('last_name','')}".rstrip()]
+    for key in payload:
+        old, new = before.get(key), data.get(key)
+        old_s = ", ".join(old) if isinstance(old, list) else (old or "—")
+        new_s = ", ".join(new) if isinstance(new, list) else (new or "—")
+        marker = "" if old_s == new_s else "  ←"
+        lines.append(f"    {key:<22} {old_s}  →  {new_s}{marker}")
+    return "\n".join(lines)
+
+
+# ── Estimate attachments ───────────────────────────────────────────────────────
+
+@mcp.tool()
+async def hcp_get_estimate_attachments(estimate_id: str) -> str:
+    """
+    List every photo and file attached to an estimate, with download links.
+
+    Attachments hang off each estimate OPTION, not the estimate itself, so this
+    walks all options and collects them in one place.  The URLs are pre-signed
+    and time limited — download them soon after running this, and re-run rather
+    than reusing an old link.
+
+    Args:
+        estimate_id: Estimate UUID (est_... or csr_...)
+    """
+    data = await api_request(
+        "GET", f"/estimates/{estimate_id}", params={"expand[]": ["attachments"]}
+    )
+    options = data.get("options") or []
+
+    found: list[tuple[str, dict]] = []
+    for opt in options:
+        label = opt.get("name") or opt.get("option_number") or opt.get("id", "?")
+        for att in (opt.get("attachments") or []):
+            found.append((str(label), att))
+    # some accounts also return them at the top level
+    for att in (data.get("attachments") or []):
+        found.append(("(estimate)", att))
+
+    customer = data.get("customer") or {}
+    header = (f"Estimate #{data.get('estimate_number','?')} — "
+              f"{customer.get('first_name','')} {customer.get('last_name','')}".rstrip())
+    if not found:
+        return (f"{header}\n\nNo attachments on this estimate "
+                f"({len(options)} option(s) checked).")
+
+    lines = [header, f"{len(found)} attachment(s) across {len(options)} option(s):", ""]
+    for i, (label, att) in enumerate(found, 1):
+        name = att.get("file_name") or att.get("name") or f"attachment-{i}"
+        lines.append(f"{i:2d}. {name}")
+        lines.append(f"    option: {label}")
+        if url := att.get("url"):
+            lines.append(f"    {url}")
+        lines.append("")
+    lines.append("Links expire — re-run this tool if one stops working.")
     return "\n".join(lines)
 
 
