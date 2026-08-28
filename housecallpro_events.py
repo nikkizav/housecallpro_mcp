@@ -56,81 +56,10 @@ async def get_event(event_id: str) -> Dict[str, Any]:
     return await api_request("GET", f"/events/{event_id}")
 
 
-@mcp.tool()
-async def create_event(
-    name: str,
-    start_time: str,
-    end_time: str,
-    employee_ids: Optional[List[str]] = None,
-    all_day: Optional[bool] = False,
-    notes: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Create a calendar event.
-
-    Args:
-        name: Event name / title (required)
-        start_time: Event start (ISO 8601)
-        end_time: Event end (ISO 8601)
-        employee_ids: List of employee UUIDs to assign
-        all_day: True for an all-day event (default False)
-        notes: Event notes
-    """
-    payload: dict = {
-        "name": name,
-        "start_time": start_time,
-        "end_time": end_time,
-        "all_day": all_day,
-    }
-    if employee_ids:
-        payload["employee_ids"] = employee_ids
-    if notes:
-        payload["notes"] = notes
-    return await api_request("POST", "/events", json=payload)
-
-
-@mcp.tool()
-async def update_event(
-    event_id: str,
-    name: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    employee_ids: Optional[List[str]] = None,
-    all_day: Optional[bool] = None,
-    notes: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Update a calendar event.
-
-    Args:
-        event_id: Event UUID (required)
-        name: New event name
-        start_time: New start time (ISO 8601)
-        end_time: New end time (ISO 8601)
-        employee_ids: Updated assigned employee list
-        all_day: All-day flag
-        notes: Updated notes
-    """
-    payload: dict = {}
-    for field in ("name", "start_time", "end_time", "employee_ids", "notes"):
-        val = locals()[field]
-        if val is not None:
-            payload[field] = val
-    if all_day is not None:
-        payload["all_day"] = all_day
-    return await api_request("PUT", f"/events/{event_id}", json=payload)
-
-
-@mcp.tool()
-async def delete_event(event_id: str) -> Dict[str, Any]:
-    """
-    Delete a calendar event.
-
-    Args:
-        event_id: Event UUID
-    """
-    return await api_request("DELETE", f"/events/{event_id}")
-
+# Removed create_event, update_event, delete_event: the underlying endpoint(s) do not exist.
+# A request to them returns Housecall Pro's HTML 404 page, meaning the route
+# itself is absent (a missing *record* returns a JSON error instead).
+# Verified against a live account 2026-08-28.
 
 if __name__ == "__main__":
     mcp.run()

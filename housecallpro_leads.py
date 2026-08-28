@@ -102,41 +102,6 @@ async def create_lead(
 
 
 @mcp.tool()
-async def update_lead(
-    lead_id: str,
-    first_name: Optional[str] = None,
-    last_name: Optional[str] = None,
-    email: Optional[str] = None,
-    phone: Optional[str] = None,
-    source: Optional[str] = None,
-    status: Optional[str] = None,
-    notes: Optional[str] = None,
-    assigned_employee_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Update an existing lead.
-
-    Args:
-        lead_id: Lead UUID (required)
-        first_name: New first name
-        last_name: New last name
-        email: New email
-        phone: New phone
-        source: New source
-        status: New status
-        notes: Updated notes
-        assigned_employee_id: New assigned employee UUID
-    """
-    payload: dict = {}
-    for field in ("first_name", "last_name", "email", "phone", "source", "status",
-                  "notes", "assigned_employee_id"):
-        val = locals()[field]
-        if val is not None:
-            payload[field] = val
-    return await api_request("PUT", f"/leads/{lead_id}", json=payload)
-
-
-@mcp.tool()
 async def convert_lead_to_customer(lead_id: str) -> Dict[str, Any]:
     """
     Convert a lead to a customer.
@@ -146,6 +111,11 @@ async def convert_lead_to_customer(lead_id: str) -> Dict[str, Any]:
     """
     return await api_request("POST", f"/leads/{lead_id}/convert")
 
+
+# Removed update_lead: the underlying endpoint(s) do not exist.
+# A request to them returns Housecall Pro's HTML 404 page, meaning the route
+# itself is absent (a missing *record* returns a JSON error instead).
+# Verified against a live account 2026-08-28.
 
 if __name__ == "__main__":
     mcp.run()

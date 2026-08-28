@@ -3956,6 +3956,383 @@ async def hcp_time_variance(
     return "\n".join(lines)
 
 
+# ── Leads ──────────────────────────────────────────────────────────────────────
+#
+# Leads are where work starts, and nothing else in this server touched them.
+# All four endpoints below were verified against a live account.  Note there is
+# NO update endpoint — PUT /leads/{id} does not exist — so a lead is created,
+# then converted, and edited in Housecall Pro itself.
+
+@mcp.tool()
+async def hcp_list_leads(
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    status: Optional[str] = None,
+    source: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+) -> str:
+    """
+    List leads with their value, source, and whether they converted.
+
+    Args:
+        page: Page number (default 1)
+        page_size: Results per page (default 50, max 200)
+        status: Filter by lead status
+        source: Filter by lead source
+        created_after: ISO 8601 datetime
+        created_before: ISO 8601 datetime
+    """
+    params = {
+        "page": _as_int(page, 1),
+        "page_size": _as_int(page_size, 50),
+        "status": status,
+        "source": source,
+        "created_after": created_after,
+        "created_before": created_before,
+    }
+    data = await api_request("GET", "/leads", params=params)
+    leads = data.get("leads", [])
+    total = data.get("total_items", len(leads))
+
+    lines = [f"Found {total} lead(s).  Showing {len(leads)}.\n"]
+    for ld in leads:
+        cust = ld.get("customer") or {}
+        name = f"{cust.get('first_name','')} {cust.get('last_name','')}".strip() or "—"
+        conv = ld.get("conversions") or []
+        conv_str = ", ".join(f"{c.get('type')} {c.get('id','')[:12]}" for c in conv) or "not converted"
+        lines.append(
+            f"• [{ld.get('number','?')}] {name}"
+            f"  |  {_dollars(ld.get('total_amount'))}"
+            f"  |  {ld.get('lead_source') or '—'}"
+            f"  |  {ld.get('status','?')} / {ld.get('pipeline_status','—')}"
+            f"\n    {conv_str}"
+            f"  |  created {(ld.get('created_at') or cust.get('created_at') or '—')[:10]}"
+            f"  |  id: {ld.get('id','')}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hcp_get_lead(lead_id: str) -> str:
+    """
+    Get one lead: customer, address, value, source, and what it became.
+
+    Args:
+        lead_id: Lead UUID (lea_...)
+    """
+    ld = await api_request("GET", f"/leads/{lead_id}")
+    cust = ld.get("customer") or {}
+    addr = ld.get("address") or {}
+    conv = ld.get("conversions") or []
+    lines = [
+        f"Lead #{ld.get('number','?')}  |  Status: {ld.get('status','?')}",
+        f"Pipeline: {ld.get('pipeline_status','—')}",
+        f"Customer: {cust.get('first_name','')} {cust.get('last_name','')}".rstrip(),
+        f"  Phone: {cust.get('mobile_number') or cust.get('home_number') or '—'}"
+        f"  |  Email: {cust.get('email') or '—'}",
+        "Address: " + (", ".join(
+            part for part in (
+                " ".join(x for x in (addr.get("street"), addr.get("street_line_2")) if x),
+                addr.get("city"),
+                " ".join(x for x in (addr.get("state"), addr.get("zip")) if x),
+            ) if part
+        ) or "—"),
+        f"Value: {_dollars(ld.get('total_amount'))}",
+        f"Source: {ld.get('lead_source') or '—'}",
+        f"Created: {(ld.get('created_at') or cust.get('created_at') or '—')[:16].replace('T',' ')}",
+        f"Tags: {', '.join(ld.get('tags') or []) or '—'}",
+    ]
+    if ld.get("lost_at"):
+        lines.append(f"Lost at: {ld['lost_at'][:10]}")
+    lines.append(
+        "Converted to: " + (", ".join(f"{c.get('type')} ({c.get('id')})" for c in conv)
+                            if conv else "not yet converted")
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hcp_create_lead(
+    customer_id: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    mobile_number: Optional[str] = None,
+    email: Optional[str] = None,
+    street: Optional[str] = None,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
+    zip_code: Optional[str] = None,
+    lead_source: Optional[str] = None,
+    note: Optional[str] = None,
+    tags: Optional[str] = None,
+) -> str:
+    """
+    Create a lead, either for an existing customer or a brand new one.
+
+    Pass customer_id for someone already in Housecall Pro.  Otherwise pass at
+    least first_name and last_name and a new customer is created with the lead.
+
+    Args:
+        customer_id: Existing customer UUID — omit to create a new customer
+        first_name: New customer's first name
+        last_name: New customer's last name
+        mobile_number: Phone
+        email: Email
+        street: Street address
+        city: City
+        state: State
+        zip_code: ZIP
+        lead_source: Where they came from (see hcp_list_lead_sources)
+        note: Free-text note about the enquiry
+        tags: Comma-separated tags
+    """
+    payload: dict[str, Any] = {}
+    if customer_id:
+        payload["customer_id"] = customer_id
+    else:
+        cust = {k: v for k, v in (("first_name", first_name), ("last_name", last_name),
+                                  ("mobile_number", mobile_number), ("email", email))
+                if v}
+        if not cust:
+            return ("Need either customer_id, or at least first_name and last_name "
+                    "to create a new customer with this lead.")
+        payload["customer"] = cust
+
+    address = {k: v for k, v in (("street", street), ("city", city),
+                                 ("state", state), ("zip", zip_code)) if v}
+    if address:
+        payload["address"] = address
+    if lead_source:
+        payload["lead_source"] = lead_source
+    if note:
+        payload["note"] = note
+    if tags:
+        payload["tags"] = _as_list(tags)
+
+    data = await api_request("POST", "/leads", json=payload)
+    cust = data.get("customer") or {}
+    return (
+        f"✓ Created lead #{data.get('number','?')}\n"
+        f"  Customer: {cust.get('first_name','')} {cust.get('last_name','')}".rstrip()
+        + f"\n  Source:   {data.get('lead_source') or '—'}"
+        f"\n  Status:   {data.get('status','?')}"
+        f"\n  Lead ID:  {data.get('id','')}\n"
+        f"  Convert it with hcp_convert_lead when it becomes real work."
+    )
+
+
+@mcp.tool()
+async def hcp_convert_lead(lead_id: str, convert_to: str = "estimate") -> str:
+    """
+    Turn a lead into an estimate or a job.
+
+    Most work should become an estimate first — that is the normal path here.
+
+    Args:
+        lead_id: Lead UUID (lea_...)
+        convert_to: 'estimate' (default) or 'job'
+    """
+    target = (convert_to or "estimate").strip().lower()
+    if target not in ("estimate", "job"):
+        return "convert_to must be 'estimate' or 'job'."
+    data = await api_request("POST", f"/leads/{lead_id}/convert", json={"type": target})
+    new_id = data.get("id") or data.get("resource_id") or ""
+    return (f"✓ Converted lead {lead_id} into a {target}.\n"
+            f"  New {target} id: {new_id}\n"
+            f"  (There is no way to edit a lead through the API — do that in "
+            f"Housecall Pro.)")
+
+
+# ── Job line items ─────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def hcp_add_job_line_item(
+    job_id: str,
+    name: str,
+    kind: str = "labor",
+    quantity: Optional[float] = 1.0,
+    unit_price: Optional[float] = None,
+    unit_cost: Optional[float] = None,
+    description: Optional[str] = None,
+    taxable: Optional[bool] = None,
+) -> str:
+    """
+    Add a line item to an existing job.
+
+    Prices are in DOLLARS here and converted to cents for the API.
+
+    For labor, `quantity` is HOURS — that is what the quoted-hours figure in
+    hcp_time_variance and hcp_post_job_analysis sums, so keep it honest.
+
+    Args:
+        job_id: Job UUID
+        name: Line item name — required
+        kind: labor | materials | fixed gratuity | fixed discount | percent discount
+        quantity: Hours for labor, count for materials (default 1)
+        unit_price: What the customer pays per unit, in dollars
+        unit_cost: What it costs you per unit, in dollars (drives margin)
+        description: Longer description
+        taxable: Whether tax applies
+    """
+    valid = ("labor", "materials", "fixed gratuity", "fixed discount", "percent discount")
+    if kind not in valid:
+        return f"kind must be one of: {', '.join(valid)}"
+    payload: dict[str, Any] = {"name": name, "kind": kind}
+    if quantity is not None:
+        payload["quantity"] = float(quantity)
+    if unit_price is not None:
+        payload["unit_price"] = int(round(float(unit_price) * 100))
+    if unit_cost is not None:
+        payload["unit_cost"] = int(round(float(unit_cost) * 100))
+    if description:
+        payload["description"] = description
+    if taxable is not None:
+        payload["taxable"] = bool(taxable)
+
+    data = await api_request("POST", f"/jobs/{job_id}/line_items", json=payload)
+    return (f"✓ Added line item to job {job_id}\n"
+            f"  {data.get('name', name)} [{data.get('kind', kind)}]"
+            f"  qty {data.get('quantity', quantity)}"
+            f"  @ {_dollars(data.get('unit_price'))}"
+            f"  = {_dollars(data.get('amount'))}\n"
+            f"  line item id: {data.get('id','')}")
+
+
+@mcp.tool()
+async def hcp_update_job_line_item(
+    job_id: str,
+    line_item_id: str,
+    name: str,
+    kind: Optional[str] = None,
+    quantity: Optional[float] = None,
+    unit_price: Optional[float] = None,
+    unit_cost: Optional[float] = None,
+    description: Optional[str] = None,
+) -> str:
+    """
+    Change a line item on a job.  `name` is required by the API even when you
+    are only changing a price, so pass the existing name if it is not changing.
+
+    Get current values from hcp_get_job_line_items first.
+
+    Args:
+        job_id: Job UUID
+        line_item_id: Line item UUID
+        name: Line item name — required by the API on every update
+        kind: labor | materials | fixed gratuity | fixed discount | percent discount
+        quantity: Hours for labor, count for materials
+        unit_price: Customer price per unit, in dollars
+        unit_cost: Your cost per unit, in dollars
+        description: Longer description
+    """
+    payload: dict[str, Any] = {"name": name}
+    if kind is not None:
+        payload["kind"] = kind
+    if quantity is not None:
+        payload["quantity"] = float(quantity)
+    if unit_price is not None:
+        payload["unit_price"] = int(round(float(unit_price) * 100))
+    if unit_cost is not None:
+        payload["unit_cost"] = int(round(float(unit_cost) * 100))
+    if description is not None:
+        payload["description"] = description
+
+    data = await api_request(
+        "PUT", f"/jobs/{job_id}/line_items/{line_item_id}", json=payload)
+    return (f"✓ Updated line item {line_item_id}\n"
+            f"  {data.get('name','?')} [{data.get('kind','?')}]"
+            f"  qty {data.get('quantity','?')}"
+            f"  @ {_dollars(data.get('unit_price'))}"
+            f"  = {_dollars(data.get('amount'))}")
+
+
+@mcp.tool()
+async def hcp_delete_job_line_item(job_id: str, line_item_id: str) -> str:
+    """
+    Remove a line item from a job.  This cannot be undone.
+
+    Args:
+        job_id: Job UUID
+        line_item_id: Line item UUID (from hcp_get_job_line_items)
+    """
+    await api_request("DELETE", f"/jobs/{job_id}/line_items/{line_item_id}")
+    return f"✓ Deleted line item {line_item_id} from job {job_id}."
+
+
+@mcp.tool()
+async def hcp_delete_job_note(job_id: str, note_id: str) -> str:
+    """
+    Delete a note from a job.
+
+    Args:
+        job_id: Job UUID
+        note_id: Note UUID
+    """
+    await api_request("DELETE", f"/jobs/{job_id}/notes/{note_id}")
+    return f"✓ Deleted note {note_id} from job {job_id}."
+
+
+# ── Customer addresses ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def hcp_get_customer_addresses(customer_id: str) -> str:
+    """
+    List every service address on a customer — second homes, rentals, and so on.
+
+    Args:
+        customer_id: Customer UUID (cus_...)
+    """
+    data = await api_request("GET", f"/customers/{customer_id}/addresses")
+    addrs = data.get("addresses") or data.get("data") or []
+    if not addrs:
+        return f"No addresses on customer {customer_id}."
+    lines = [f"{len(addrs)} address(es) on customer {customer_id}:"]
+    for a in addrs:
+        lines.append(
+            f"  • {a.get('street','')} {a.get('street_line_2','') or ''}".rstrip()
+            + f"\n    {a.get('city','')}, {a.get('state','')} {a.get('zip','')}"
+            f"\n    id: {a.get('id','')}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hcp_create_customer_address(
+    customer_id: str,
+    street: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    street_line_2: Optional[str] = None,
+    country: Optional[str] = "US",
+) -> str:
+    """
+    Add another service address to an existing customer.
+
+    Args:
+        customer_id: Customer UUID (cus_...)
+        street: Street address — required
+        city: City — required
+        state: Two-letter state — required
+        zip_code: ZIP — required
+        street_line_2: Unit / suite
+        country: Country code (default US)
+    """
+    payload: dict[str, Any] = {
+        "street": street, "city": city, "state": state,
+        "zip": zip_code, "country": country or "US",
+    }
+    if street_line_2:
+        payload["street_line_2"] = street_line_2
+    data = await api_request(
+        "POST", f"/customers/{customer_id}/addresses", json=payload)
+    return (f"✓ Added address to customer {customer_id}\n"
+            f"  {data.get('street','')} {data.get('city','')}, "
+            f"{data.get('state','')} {data.get('zip','')}\n"
+            f"  address id: {data.get('id','')}")
+
+
 # ── Customer updates ───────────────────────────────────────────────────────────
 
 @mcp.tool()

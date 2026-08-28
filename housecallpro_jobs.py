@@ -290,7 +290,9 @@ async def bulk_update_job_input_materials(
         input_materials: List of material objects with name, quantity, unit_cost, etc.
     """
     return await api_request(
-        "PUT", f"/jobs/{job_id}/job_input_materials",
+        # /bulk_update, not the bare path — the bare PUT route does not exist
+        # (returns Housecall Pro's HTML 404 page). Verified 2026-08-28.
+        "PUT", f"/jobs/{job_id}/job_input_materials/bulk_update",
         json={"job_input_materials": input_materials},
     )
 

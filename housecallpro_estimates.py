@@ -98,42 +98,10 @@ async def create_estimate(
     return await api_request("POST", "/estimates", json=payload)
 
 
-@mcp.tool()
-async def update_estimate(
-    estimate_id: str,
-    notes: Optional[str] = None,
-    work_status: Optional[str] = None,
-    line_items: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """
-    Update an existing estimate.
-
-    Args:
-        estimate_id: Estimate UUID (required)
-        notes: Updated notes
-        work_status: Updated status
-        line_items: Updated line items list
-    """
-    payload: dict = {}
-    if notes is not None:
-        payload["notes"] = notes
-    if work_status is not None:
-        payload["work_status"] = work_status
-    if line_items is not None:
-        payload["line_items"] = line_items
-    return await api_request("PUT", f"/estimates/{estimate_id}", json=payload)
-
-
-@mcp.tool()
-async def delete_estimate(estimate_id: str) -> Dict[str, Any]:
-    """
-    Delete an estimate. Cannot be undone.
-
-    Args:
-        estimate_id: Estimate UUID
-    """
-    return await api_request("DELETE", f"/estimates/{estimate_id}")
-
+# Removed update_estimate, delete_estimate: the underlying endpoint(s) do not exist.
+# A request to them returns Housecall Pro's HTML 404 page, meaning the route
+# itself is absent (a missing *record* returns a JSON error instead).
+# Verified against a live account 2026-08-28.
 
 if __name__ == "__main__":
     mcp.run()

@@ -34,71 +34,10 @@ async def get_job_invoices(
     return await api_request("GET", f"/jobs/{job_id}/invoices", params=params)
 
 
-@mcp.tool()
-async def get_job_invoice(job_id: str, invoice_id: str) -> Dict[str, Any]:
-    """
-    Get a specific invoice for a job.
-
-    Args:
-        job_id: Job UUID
-        invoice_id: Invoice UUID
-    """
-    return await api_request("GET", f"/jobs/{job_id}/invoices/{invoice_id}")
-
-
-@mcp.tool()
-async def create_job_invoice(
-    job_id: str,
-    line_items: Optional[List[Dict[str, Any]]] = None,
-    notes: Optional[str] = None,
-    due_concept: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Create a new invoice for a job.
-
-    Args:
-        job_id: Job UUID (required)
-        line_items: List of line item objects
-        notes: Invoice notes
-        due_concept: Due date concept (e.g. upon_receipt, net_30)
-    """
-    payload: dict = {}
-    if line_items:
-        payload["line_items"] = line_items
-    if notes:
-        payload["notes"] = notes
-    if due_concept:
-        payload["due_concept"] = due_concept
-    return await api_request("POST", f"/jobs/{job_id}/invoices", json=payload)
-
-
-@mcp.tool()
-async def update_job_invoice(
-    job_id: str,
-    invoice_id: str,
-    notes: Optional[str] = None,
-    due_concept: Optional[str] = None,
-    line_items: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """
-    Update an existing job invoice.
-
-    Args:
-        job_id: Job UUID
-        invoice_id: Invoice UUID
-        notes: Updated notes
-        due_concept: Updated due date concept
-        line_items: Updated line items list
-    """
-    payload: dict = {}
-    if notes is not None:
-        payload["notes"] = notes
-    if due_concept is not None:
-        payload["due_concept"] = due_concept
-    if line_items is not None:
-        payload["line_items"] = line_items
-    return await api_request("PUT", f"/jobs/{job_id}/invoices/{invoice_id}", json=payload)
-
+# Removed get_job_invoice, create_job_invoice, update_job_invoice: the underlying endpoint(s) do not exist.
+# A request to them returns Housecall Pro's HTML 404 page, meaning the route
+# itself is absent (a missing *record* returns a JSON error instead).
+# Verified against a live account 2026-08-28.
 
 if __name__ == "__main__":
     mcp.run()
