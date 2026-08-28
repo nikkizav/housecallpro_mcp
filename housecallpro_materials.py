@@ -38,7 +38,7 @@ async def get_materials(
     }
     if is_active is not None:
         params["is_active"] = is_active
-    return await api_request("GET", "/materials", params=params)
+    return await api_request("GET", "/api/price_book/materials", params=params)
 
 
 @mcp.tool()
@@ -49,7 +49,7 @@ async def get_material(material_id: str) -> Dict[str, Any]:
     Args:
         material_id: Material UUID
     """
-    return await api_request("GET", f"/materials/{material_id}")
+    return await api_request("GET", f"/api/price_book/materials/{material_id}")
 
 
 @mcp.tool()
@@ -79,7 +79,7 @@ async def create_material(
         val = locals()[field]
         if val is not None:
             payload[field] = val
-    return await api_request("POST", "/materials", json=payload)
+    return await api_request("POST", "/api/price_book/materials", json=payload)
 
 
 @mcp.tool()
@@ -115,7 +115,7 @@ async def update_material(
             payload[field] = val
     if is_active is not None:
         payload["is_active"] = is_active
-    return await api_request("PUT", f"/materials/{material_id}", json=payload)
+    return await api_request("PUT", f"/api/price_book/materials/{material_id}", json=payload)
 
 
 if __name__ == "__main__":

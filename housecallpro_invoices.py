@@ -75,7 +75,7 @@ async def get_invoice(invoice_uuid: str) -> Dict[str, Any]:
     Args:
         invoice_uuid: Invoice UUID
     """
-    return await api_request("GET", f"/invoices/{invoice_uuid}")
+    return await api_request("GET", f"/api/invoices/{invoice_uuid}")
 
 
 @mcp.tool()
@@ -100,38 +100,14 @@ async def get_job_invoices(
     return await api_request("GET", f"/jobs/{job_id}/invoices", params=params)
 
 
-@mcp.tool()
-async def send_invoice(invoice_uuid: str) -> Dict[str, Any]:
-    """
-    Send an invoice to the customer.
-
-    Args:
-        invoice_uuid: Invoice UUID
-    """
-    return await api_request("POST", f"/invoices/{invoice_uuid}/send")
-
-
-@mcp.tool()
-async def record_payment(
-    invoice_uuid: str,
-    amount: int,
-    payment_method: str,
-    note: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Record a payment on an invoice.
-
-    Args:
-        invoice_uuid: Invoice UUID
-        amount: Payment amount in cents (e.g. 15000 = $150.00)
-        payment_method: credit_card | ach | external | consumer_financing | mobile_check_deposit
-        note: Optional payment note
-    """
-    payload: dict = {"amount": amount, "payment_method": payment_method}
-    if note:
-        payload["note"] = note
-    return await api_request("POST", f"/invoices/{invoice_uuid}/payments", json=payload)
-
-
+# ── Removed: send_invoice and record_payment ──────────────────────────────────
+#
+# Both called endpoints that do not exist:
+#     POST /invoices/{id}/send      -> HTTP 404
+#     POST /invoices/{id}/payments  -> HTTP 404
+# They are absent from the v1-4 spec and 404 against a live account, so they
+# could never have worked. The public API exposes no way to send an invoice or
+# record a payment - do those in Housecall Pro itself.
+#
 if __name__ == "__main__":
     mcp.run()

@@ -128,6 +128,14 @@
       "Only started_at/completed_at exist on work_timestamps — there is no per-tech time tracking and no pause data in the public API.",
       "/api/price_book/services returns service_materials and service_labor_rates as empty arrays unless you pass expand[].",
       "Canceled jobs are archived; /jobs/{id}/appointments returns HTTP 400 'Archived job' for them permanently.",
+      "Array query params MUST use the [] suffix. expand[]=attachments works; expand=attachments returns HTTP 400, in both scalar and repeated form. Same for work_status[] and price-book expand[].",
+      "Several resources are NOT at the path you would guess, and the wrong one returns a 404 HTML page rather than a JSON error: invoice detail is /api/invoices/{id} (not /invoices/{id}, even though the LIST is /invoices); materials, material_categories and price_forms all live under /api/price_book/; job types are at /job_fields/job_types.",
+      "There are NO payment or deposit endpoints in the public API. Sending an invoice and recording a payment can only be done inside Housecall Pro.",
+      "Estimates cannot be updated: no PUT/PATCH on /estimates/{id} and no PUT/DELETE on options. You can create an option but never rename or remove one. There is also no endpoint for tagging an estimate - tags exist only for jobs.",
+      "There are no messaging, conversation or SMS endpoints, so customer chat history cannot be read through the API at all.",
+      "Attachments are readable via expand[]=attachments on jobs and estimates, and hang off each estimate OPTION rather than the estimate itself. The returned S3 URLs are pre-signed and expire after about an hour.",
+      "Schedule objects carry scheduled_start_local / scheduled_end_local plus an IANA time_zone (added 2026-08-20). Prefer these for display AND for bucketing work into days - the UTC fields put an evening job on the following day.",
+      "Estimate options carry approval_status_updated_at (added 2026-08-26). It moves on EVERY approval transition, including approved -> declined, so it is not an 'approved at' date; read it with approval_status.",
       "Fanning out more than ~90 concurrent job sub-requests draws HTTP 429. Never treat a failed fetch as an empty payload — it silently becomes '0 quoted hours'."
     ]
   }

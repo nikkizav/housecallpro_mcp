@@ -24,7 +24,7 @@ async def get_job_types(
         page: Page number (default 1)
         page_size: Results per page (default 100)
     """
-    return await api_request("GET", "/job_types", params={"page": page, "page_size": page_size})
+    return await api_request("GET", "/job_fields/job_types", params={"page": page, "page_size": page_size})
 
 
 @mcp.tool()
@@ -35,7 +35,7 @@ async def get_job_type(job_type_id: str) -> Dict[str, Any]:
     Args:
         job_type_id: Job type UUID
     """
-    return await api_request("GET", f"/job_types/{job_type_id}")
+    return await api_request("GET", f"/job_fields/job_types/{job_type_id}")
 
 
 @mcp.tool()
@@ -53,7 +53,7 @@ async def create_job_type(
     payload: dict = {"name": name}
     if description:
         payload["description"] = description
-    return await api_request("POST", "/job_types", json=payload)
+    return await api_request("POST", "/job_fields/job_types", json=payload)
 
 
 @mcp.tool()
@@ -75,7 +75,7 @@ async def update_job_type(
         payload["name"] = name
     if description is not None:
         payload["description"] = description
-    return await api_request("PUT", f"/job_types/{job_type_id}", json=payload)
+    return await api_request("PUT", f"/job_fields/job_types/{job_type_id}", json=payload)
 
 
 if __name__ == "__main__":

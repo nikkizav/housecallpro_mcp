@@ -60,7 +60,15 @@ async def get_employee(employee_id: str) -> Dict[str, Any]:
     Args:
         employee_id: Employee UUID
     """
-    return await api_request("GET", f"/employees/{employee_id}")
+    # /employees/{id} returns HTTP 404 — there is no detail endpoint.
+    # Fetch the list and pick the one we want.
+    data = await api_request("GET", "/employees",
+                             params={"page": 1, "page_size": 200})
+    for emp in (data.get("employees") or []):
+        if emp.get("id") == employee_id:
+            return emp
+    return {"error": f"No employee with id {employee_id}",
+            "hint": "Use get_employees to list valid ids."}
 
 
 @mcp.tool()

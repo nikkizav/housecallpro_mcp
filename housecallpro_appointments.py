@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+⚠ NOT WORKING — every endpoint in this file returns HTTP 404.
+
+Verified against a live account on 2026-08-28. These paths are not in the
+Housecall Pro public API (v1-4). Do not register this server in your Claude
+Desktop config; nothing in it can succeed.
+
+Use the main server instead: hcp_get_job_appointments, hcp_create_appointment,
+hcp_update_appointment and hcp_delete_appointment all work, because the real
+endpoints are job-scoped (/jobs/{job_id}/appointments), not top-level.
+
+Original description:
 Housecall Pro Appointments MCP Server
 Standalone appointment CRUD (job-specific appointments are also in housecallpro_jobs.py).
 """

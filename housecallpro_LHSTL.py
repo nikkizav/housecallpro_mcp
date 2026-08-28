@@ -1243,7 +1243,7 @@ async def hcp_get_invoice(invoice_uuid: str) -> str:
     Args:
         invoice_uuid: Invoice UUID
     """
-    inv = await api_request("GET", f"/invoices/{invoice_uuid}")
+    inv = await api_request("GET", f"/api/invoices/{invoice_uuid}")
     lines = [
         f"Invoice #{inv.get('invoice_number','?')}  |  Status: {inv.get('status','?')}",
         f"Job ID: {inv.get('job_id','—')}",
@@ -1389,6 +1389,17 @@ async def hcp_get_estimate(estimate_id: str) -> str:
             f"  |  Tags: {tags_str}{notes_str}"
             f"  |  id: {opt.get('id','')}"
         )
+        # approval_status_updated_at (API change 2026-08-26) moves on EVERY
+        # transition, including approved -> declined, so it is not an
+        # "approved at" date. Only meaningful read next to approval_status.
+        if changed := opt.get("approval_status_updated_at"):
+            age = ""
+            if (when := _dtp(changed)) is not None:
+                days = (dt.now(when.tzinfo) - when).days
+                age = f"  ({days} day(s) ago)" if days >= 0 else ""
+            lines.append(
+                f"      status last changed: {changed[:16].replace('T', ' ')}{age}"
+            )
     return "\n".join(lines)
 
 

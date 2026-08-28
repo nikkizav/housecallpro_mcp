@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+⚠ NOT WORKING — every endpoint in this file returns HTTP 404.
+
+Verified against a live account on 2026-08-28. These paths are not in the
+Housecall Pro public API (v1-4). Do not register this server in your Claude
+Desktop config; nothing in it can succeed.
+
+There is no /schedule endpoint. Use hcp_get_week_schedule or hcp_multi_week_view
+on the main server, which build the schedule from jobs and appointments.
+
+Original description:
 Housecall Pro Schedule MCP Server
 Schedule / dispatch board access — routes and routing.
 """

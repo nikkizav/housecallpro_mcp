@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+⚠ NOT WORKING — every endpoint in this file returns HTTP 404.
+
+Verified against a live account on 2026-08-28. These paths are not in the
+Housecall Pro public API (v1-4). Do not register this server in your Claude
+Desktop config; nothing in it can succeed.
+
+The spec has POST and DELETE /webhooks/subscription only - there is no way to
+list or update webhooks, and the /webhooks paths used here do not exist.
+
+Original description:
 Housecall Pro Webhooks MCP Server
 Webhook subscription management.
 """
