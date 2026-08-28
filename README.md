@@ -346,12 +346,12 @@ you give up. Pick **Allow for this task** and it runs.
 The pop-up names the tool it wants to run, and the name tells you what it does:
 
 - **`hcp_list_…`, `hcp_get_…`, `hcp_time_variance`, `hcp_post_job_analysis`** —
-  these only look things up. 27 of the 43 tools are read-only. Nothing you approve
+  these only look things up. 28 of the 45 tools are read-only. Nothing you approve
   here can change anything.
 - **`hcp_create_…`, `hcp_update_…`, `hcp_delete_…`, `hcp_add_…`, `hcp_remove_…`,
   `hcp_set_…`, `hcp_write_estimate`, `hcp_finalize_estimate`,
   `hcp_approve_estimate_option`** — these **change your Housecall Pro data**. There
-  are 16 of them. Read what it says before allowing.
+  are 17 of them. Read what it says before allowing.
 
 If you asked a question and it wants to *change* something, that's worth a second
 look — say Deny and ask what it's trying to do.
@@ -570,7 +570,7 @@ Added or lost a tech? Re-run the setup wizard, then `hcp_check_setup`.
 
 Everything below is optional.
 
-**Architecture.** `housecallpro_LHSTL.py` is the main server: 43 tools returning
+**Architecture.** `housecallpro_LHSTL.py` is the main server: 45 tools returning
 formatted, readable output. The other 20 `housecallpro_<domain>.py` files are thin
 wrappers returning raw JSON — register one in your Claude config only if you want
 unformatted access to a specific area.

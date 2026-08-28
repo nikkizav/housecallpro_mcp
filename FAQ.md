@@ -123,7 +123,7 @@ lot of separate lookups — a month's time variance can be two hundred — so on
 
 The pop-up names the tool, and the name tells you what it does. Anything starting
 `hcp_list_` or `hcp_get_`, plus `hcp_time_variance` and `hcp_post_job_analysis`,
-only reads. That's 27 of the 43 tools. The 16 that can change something start with
+only reads. That's 28 of the 45 tools. The 17 that can change something start with
 `create`, `update`, `delete`, `add`, `remove`, `set`, `write`, `finalize` or
 `approve` — worth actually reading before you allow.
 
