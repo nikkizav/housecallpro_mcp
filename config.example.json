@@ -185,19 +185,23 @@
     ],
     "_skip_note": "Food, drink and delivery fees are never a job cost. Matched on the supplier's own department/class columns.",
     "supplier_column_aliases": {
-      "_comment": "The importer already recognises Home Depot's export. Other suppliers use different column names; add them here rather than changing code.",
+      "_comment": "Home Depot, Lowe's and Sherwin-Williams exports are recognised already. Add another supplier by listing its column names here. FIRST match wins, so order matters.",
       "job": [
+        "PO Number",
         "Job Name",
         "Job",
         "Job Number",
-        "PO Number"
+        "Project Name"
       ],
+      "_job_note": "PO Number leads deliberately. Sherwin-Williams also has a 'Job Number' (always 1) and a 'Job Name' (always your own company) \u2014 both decoys. Home Depot has no PO column and its 'Job Name' really is the job.",
       "amount": [
         "Extended Retail (before discount)",
-        "Extended Price",
+        "Total Price",
         "Line Total",
-        "Amount"
-      ]
+        "Amount",
+        "Price"
+      ],
+      "_amount_note": "Must be the EXTENDED line total, never a unit price. Lowe's has both ('Item Price' unit, 'Total Price' extended). Sherwin-Williams calls its extended total plain 'Price' while still showing a Quantity \u2014 2 x $93.50 is a $93.50 line there, not $187."
     },
     "always_general_keywords": [
       "glove",
@@ -213,6 +217,12 @@
     "always_job_keywords": [],
     "_always_job_note": "Always a job material, overriding everything else. Add items you have decided once and do not want asked about again.",
     "_ambiguous_note": "Blades, drill bits, sandpaper, tape, brushes, buckets and similar are deliberately NOT guessed \u2014 the same drill bit is a job material when bought for that job and van stock when bought to restock the truck. They go to a review list. Route them in bulk with supplies='job' or supplies='general' on the import, or move specific ones into the two lists above once you have decided.",
-    "_reuse_note": "Leftovers that go back on the van (half a can of primer, say) are not tracked. The whole purchase stays on the job it was bought for, which slightly overstates that job and understates the next one that uses the remainder."
+    "_reuse_note": "Leftovers that go back on the van (half a can of primer, say) are not tracked. The whole purchase stays on the job it was bought for, which slightly overstates that job and understates the next one that uses the remainder.",
+    "_supplier_notes": [
+      "Home Depot: cp1252 encoded, not UTF-8. Its 'Company Name' header line is YOUR account, not the store.",
+      "Sherwin-Williams: puts the order's PO and date on the FIRST line of each invoice only; later lines are blank and are carried down, matched on Invoice Number.",
+      "Lowe's: job is the PO Number, and '00' means no job. Snacks and coffee sit under sub category FRONT END AND CONVENIENCE.",
+      "Category words are matched as substrings across department/class/subclass together, because each supplier files food in a different column."
+    ]
   }
 }

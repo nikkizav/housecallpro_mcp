@@ -4661,7 +4661,9 @@ _VAN_STOCK_WORDS = ("glove", "trash bag", "contractor bag", "rag ", "rags",
                     "permanent marker", "jobsite marker")
 _AMBIGUOUS_WORDS = ("blade", "drill bit", " bit ", "bit set", "sanding",
                     "abrasive", "sandpaper", "disc", "sponge", "tape",
-                    "liner", "brush", "roller", "shim", "bucket", "pail")
+                    "liner", "brush", "roller", "shim", "bucket", "pail",
+                    "caulk gun", "fan", "heater", "dehumidifier", "blower",
+                    "extension cord", "drop cloth", "tarp")
 
 _TOOL_CLASSES = {"PORTABLE POWER", "WET DRY VACS"}
 _TOOL_WORDS = ("combo kit", "starter kit", "rotary hammer", "impact driver",
@@ -4671,25 +4673,47 @@ _TOOL_WORDS = ("combo kit", "starter kit", "rotary hammer", "impact driver",
 # under a tool-ish class.
 _CONSUMABLE_WORDS = ("blade", "bit", "abrasive", "sanding", "disc", "brush",
                      "roller", "tape", "glove", "caulk", "sponge", "liner")
-_SKIP_CLASSES = {"CONVENIENCE"}
-_SKIP_SUBCLASSES = {"BEVERAGES", "SNACKS", "CANDY"}
-_SKIP_DEPARTMENTS = {"FEES"}
-_NON_JOB_LABELS = {"", "0", "VAN", "SHOP", "STOCK", "OFFICE", "N/A", "NONE"}
+# Matched as substrings against department, class AND subclass together —
+# Home Depot files a Red Bull under class CONVENIENCE / subclass BEVERAGES,
+# Lowe's files a coffee under category SEASONAL & CLEANING / sub category
+# FRONT END AND CONVENIENCE. Same thing, different column, different wording.
+_SKIP_CATEGORY_WORDS = ("CONVENIENCE", "BEVERAGE", "SNACK", "CANDY",
+                        "FRONT END", "TOBACCO")
+_SKIP_DEPT_WORDS = ("FEES", "DELIVERY FEE", "SHIPPING")
+_NON_JOB_LABELS = {"", "0", "00", "000", "VAN", "SHOP", "STOCK", "OFFICE",
+                   "N/A", "NONE", "NA"}
 
 # Column aliases so other suppliers can be added without new code.
+# Order matters: the FIRST alias present in the file wins.
+#
+# "PO Number" leads because Sherwin-Williams also ships a "Job Number" (always 1)
+# and a "Job Name" (always the company name) — both decoys. The job we want is
+# the PO. Home Depot has no PO column and falls through to its "Job Name", which
+# genuinely holds the job number.
+#
+# The amount aliases put the EXTENDED total ahead of any unit price. Lowe's has
+# both ("Item Price" unit, "Total Price" extended) and Sherwin-Williams calls its
+# extended total plain "Price" while still carrying a Quantity — 2 × $93.50 is a
+# $93.50 line there, not $187.
 _COL_ALIASES = {
-    "job":        ("Job Name", "Job", "Job Number", "PO Number", "Job/PO"),
-    "date":       ("Date", "Transaction Date", "Purchase Date", "Invoice Date"),
-    "sku":        ("SKU Number", "SKU", "Item Number", "Product Code"),
-    "desc":       ("SKU Description", "Description", "Item Description", "Product"),
+    "job":        ("PO Number", "Job Name", "Job", "Job Number", "Job/PO",
+                   "Project Name"),
+    "date":       ("Date", "Order Date", "Transaction Date", "Purchase Date",
+                   "Invoice Date"),
+    "sku":        ("SKU Number", "SKU", "Item Number", "Product/REX Number",
+                   "Product Code", "Model Number"),
+    "desc":       ("SKU Description", "Item Description", "Product Name",
+                   "Description", "Product"),
     "qty":        ("Quantity", "Qty", "QTY"),
     "amount":     ("Extended Retail (before discount)", "Extended Price",
-                   "Net Amount", "Line Total", "Amount", "Extended Retail"),
-    "unit":       ("Net Unit Price", "Unit Price", "Price"),
-    "department": ("Department Name", "Department", "Dept"),
-    "klass":      ("Class Name", "Class", "Category"),
-    "subclass":   ("Subclass Name", "Subclass", "Sub Category"),
-    "purchaser":  ("Purchaser", "Buyer", "Employee", "Cardholder"),
+                   "Total Price", "Line Total", "Net Amount", "Extended Retail",
+                   "Amount", "Price"),
+    "unit":       ("Net Unit Price", "Unit Price", "Item Price"),
+    "department": ("Department Name", "Department", "Dept", "Category"),
+    "klass":      ("Class Name", "Class", "Sub Category"),
+    "subclass":   ("Subclass Name", "Subclass", "Product Group"),
+    "purchaser":  ("Purchaser", "Buyer", "Employee", "Cardholder",
+                   "Purchaser Name"),
     "receipt":    ("Invoice Number", "Order Number", "Transaction ID",
                    "Receipt", "Receipt Number"),
 }
@@ -4733,13 +4757,28 @@ def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
         text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()
     vendor = ""
-    for ln in lines[:12]:
-        low = ln.lower()
-        if low.startswith("company name,"):
-            vendor = ln.split(",", 1)[1].strip()
-        for known in ("home depot", "lowe", "sherwin", "menards", "ferguson"):
-            if known in low and not vendor:
-                vendor = ln.strip()[:40]
+    head = " ".join(lines[:8])
+    for name, cols in (("Sherwin-Williams", ("Color Name", "Product/REX Number")),
+                       ("Lowes", ("Fulfillment Type", "Order Reference")),
+                       ("Home Depot", ("Program Discount Indicator", "SKU Description"))):
+        if all(c in head for c in cols):
+            vendor = name
+            break
+    if not vendor:
+        for ln in lines[:12]:
+            low = ln.lower()
+            for known in ("home depot", "lowe", "sherwin", "menards", "ferguson"):
+                if known in low:
+                    vendor = ln.strip()[:40]
+                    break
+            if vendor:
+                break
+    if not vendor:
+        stem = Path(path).stem.replace("_", " ")
+        for known in ("Home Depot", "Lowes", "Lowe's", "Sherwin", "Menards"):
+            if known.lower() in stem.lower():
+                vendor = known
+                break
     header_idx = 0
     for i, ln in enumerate(lines[:40]):
         cells = [c.strip().strip('"') for c in ln.split(",")]
@@ -4748,6 +4787,30 @@ def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
             break
     reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
     rows = [r for r in reader if any((v or "").strip() for v in r.values())]
+
+    # Some exports put the order's details on its FIRST line only and leave them
+    # blank on the rest — Sherwin-Williams does this, so two of five sample rows
+    # carry no PO and would look like they belong to no job. Carry the order's
+    # values down onto its own continuation rows, matched on the invoice/order
+    # number so nothing leaks between orders.
+    carry = ("PO Number", "Job Name", "Job Number", "Order Date", "Date",
+             "Purchaser", "Purchaser Name")
+    group_cols = ("Invoice Number", "Order Number")
+    last: dict[str, str] = {}
+    last_group = None
+    for r in rows:
+        group = next((str(r.get(c) or "").strip() for c in group_cols
+                      if str(r.get(c) or "").strip()), "")
+        if group and group != last_group:
+            last, last_group = {}, group
+        for col in carry:
+            if col not in r:
+                continue
+            val = str(r.get(col) or "").strip()
+            if val:
+                last[col] = val
+            elif last.get(col):
+                r[col] = last[col]
     return rows, vendor
 
 
@@ -4764,9 +4827,10 @@ def _classify(row: dict, tool_threshold: float,
     job = _pick(row, "job").upper()
     amount = abs(_money(_pick(row, "amount")))
 
-    if dept in _SKIP_DEPARTMENTS:
-        return "skip", f"{dept.title()} line, not a material"
-    if klass in _SKIP_CLASSES or sub in _SKIP_SUBCLASSES:
+    haystack = " | ".join((dept, klass, sub))
+    if any(w in haystack for w in _SKIP_DEPT_WORDS):
+        return "skip", "fee or delivery line, not a material"
+    if any(w in haystack for w in _SKIP_CATEGORY_WORDS):
         return "skip", "food or drink, not a job cost"
     if amount == 0:
         return "skip", "$0 line (bundle component or fee)"
@@ -4781,6 +4845,11 @@ def _classify(row: dict, tool_threshold: float,
     if job in _NON_JOB_LABELS:
         label = job or "blank"
         return "general", f"no job on the receipt (job field = {label})"
+    # Some exports put an account or company name where the job should be
+    # (Sherwin-Williams fills "Job Name" with the company on every line). A job
+    # reference is a number here, so anything else means we do not know the job.
+    if not re.fullmatch(r"[0-9][0-9\-]*", job):
+        return "general", f"no usable job reference on the receipt ({job[:24]})"
 
     # Company-specific pins beat everything below.
     if any(w and w in low for w in always_job):
@@ -4797,6 +4866,16 @@ def _classify(row: dict, tool_threshold: float,
             return "general", "consumable, treated as van stock this run"
         return "review", "job material or van stock? same item can be either"
     return "job", ""
+
+def _already_imported(m: dict, seen: set) -> bool:
+    """Has this item from this receipt already been posted to this job?
+
+    Keyed on part number plus receipt id rather than the whole marker string,
+    so relabelling the supplier does not make a re-import look like new work.
+    """
+    sku = str(m.get("sku") or "").strip()
+    return any((sku, str(r).strip()) in seen for r in (m.get("receipts") or ()))
+
 
 def _receipt_marker(vendor: str, m: dict) -> str:
     """Stable per-line note so a second import can recognise its own work."""
@@ -4952,11 +5031,16 @@ async def hcp_import_job_costs(
             mats = d.get("job_input_materials") or d.get("data") or []
         except Exception:
             mats = []
-        existing[num] = {
-            (str(m.get("part_number") or "").strip(),
-             str(m.get("description") or "").strip())
-            for m in mats if isinstance(m, dict)
-        }
+        seen_keys = set()
+        for m in mats:
+            if not isinstance(m, dict):
+                continue
+            part = str(m.get("part_number") or "").strip()
+            for rid in re.findall(r"receipt\s+(\S+)",
+                                  str(m.get("description") or "")):
+                for one in rid.split(","):
+                    seen_keys.add((part, one.strip()))
+        existing[num] = seen_keys
 
     D = lambda v: f"${v:,.2f}"
     lines = [
@@ -4975,8 +5059,7 @@ async def hcp_import_job_costs(
         job = lookup.get(num)
         items = sorted(by_job[num], key=lambda m: -m["amount"])
         jtotal = sum(m["amount"] for m in items)
-        dupes = [m for m in items
-                 if (m["sku"], _receipt_marker(vendor, m)) in existing.get(num, set())]
+        dupes = [m for m in items if _already_imported(m, existing.get(num, set()))]
         fresh = [m for m in items if m not in dupes]
         if job:
             head = f"║  #{num} — {(job.get('description') or '')[:38]}"
@@ -5057,7 +5140,7 @@ async def hcp_import_job_costs(
         payload = []
         for m in by_job.get(num, []):
             marker = _receipt_marker(vendor, m)
-            if (m["sku"], marker) in existing.get(num, set()):
+            if _already_imported(m, existing.get(num, set())):
                 continue
             qty = round(m["qty"], 2) or 1.0
             payload.append({
