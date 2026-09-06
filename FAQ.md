@@ -191,13 +191,31 @@ No. It runs on Housecall Pro's API, which comes with MAX, and every Local Handym
 owner is on MAX already. Nothing to buy and nothing to change.
 
 *If you're outside the Local Handyman network:* confirm you have API access first.
-Click the **My Apps** tile on the top bar — the nine-squares icon next to Settings
-— then **Go to App Store**, and search for **API**. No **API Key Management** tile
-means you're on a plan below MAX and this won't work yet.
+Click the **9-box app button** at the **top right** of Housecall Pro, then
+**Go to App Store**, and search for **API**. No **API Key Management** means
+you're on a plan below MAX and this won't work yet.
 
 **How long does setup take?**
 
 About 15 minutes, mostly waiting on downloads.
+
+**Am I doing a fresh install or an update?**
+
+If there's a `config.json` in your project folder, you've already installed — you
+want the update path in the README, not Setup. Running Setup again on top of an
+existing install is where people get tangled.
+
+The update is: save `config.json`, replace the folder, put the file back, re-run
+the wizard, restart Claude. You do not need a new API key.
+
+**The old folder won't delete — something about `.venv`**
+
+That's the Python environment, and Claude Desktop still has it open. Fully quit
+Claude first (`Cmd + Q` on Mac, right-click the tray icon → Quit on Windows),
+close any Terminal windows, then delete. On Windows, if it still refuses, restart
+the computer and delete before reopening Claude.
+
+You never need to keep `.venv` — it rebuilds itself.
 
 **Do I need to keep it updated?**
 

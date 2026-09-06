@@ -50,6 +50,7 @@ to think about it again.
 - [Set up a Project](#set-up-a-project-so-you-dont-repeat-yourself)
 - [What to ask](#what-to-ask)
 - [Reading the numbers](#reading-the-numbers) ← **the important section**
+- [Which path are you on?](#which-path-are-you-on) — new install or update
 - [Updating to a new version](#updating-to-a-new-version)
 - [When something goes wrong](#when-something-goes-wrong)
 - [Settings you should review](#settings-you-should-review)
@@ -63,11 +64,25 @@ to think about it again.
 
 ---
 
+## Which path are you on?
+
+Two different jobs. Pick one — don't do both.
+
+| | |
+|---|---|
+| **Never installed this before** | → [Before you start](#before-you-start), then [Setup](#setup). About 15 minutes. |
+| **Already have it running, getting a new version** | → skip straight to [Updating to a new version](#updating-to-a-new-version). About 5 minutes, and **save your `config.json` first**. |
+
+Not sure? Look in your project folder. If there's a **`config.json`** in it, you've
+already installed and you want the *update* path.
+
+---
+
 ## Before you start
 
 | You need | Notes |
 |---|---|
-| **Housecall Pro API access** | Comes with the MAX plan. Local Handyman owners are all on MAX, so there's nothing to check. Outside that network: open **My Apps → Go to App Store** and search for **API**. If there's no **API Key Management** tile, you're on a lower plan and this won't work yet. |
+| **Housecall Pro API access** | Comes with the MAX plan. Local Handyman owners are all on MAX, so there's nothing to check. Outside that network: **9-box app button, top right → Go to App Store →** search **API**. No **API Key Management** means you're on a lower plan and this won't work yet. |
 | **Claude desktop app** | Free to download at [claude.ai/download](https://claude.ai/download). **Install it and open it once before you start** — Claude creates the settings folder you'll need in Step 5 the first time it runs. Sign in with your Claude account. |
 | **About 15 minutes** | Mostly waiting on downloads. |
 
@@ -83,13 +98,13 @@ press Enter.
 
 In Housecall Pro:
 
-1. On the top bar, click the **My Apps** tile — the icon made of nine small
-   squares, sitting next to Settings
-2. Click the **Go to App Store** button
+1. **Top right** of Housecall Pro, click the **9-box app button** (a square
+   made of nine smaller squares)
+2. Click **Go to App Store**
 3. Search for **API**
-4. Open the **API Key Management** tile
-5. Click the **Generate a new API key** tile, and name it something you'll
-   recognise later — `Claude` works
+4. Open **API Key Management**
+5. **Generate a new API key** and name it something you'll recognise —
+   `Claude` works
 6. Copy the key it gives you
 
 This key is how your computer proves it's allowed to read your account. **Treat it
@@ -498,7 +513,9 @@ quarter.
 
 ## Updating to a new version
 
-Takes about five minutes. Same steps whichever version you're on.
+**This replaces Steps 1–5, it does not repeat them.** You already have an API
+key and Claude is already connected — you're swapping the files and re-pointing
+them. Takes about five minutes.
 
 > **Before you touch anything:** your settings live in a file called
 > **`config.json`** inside the project folder — your team, your cost per hour,
@@ -541,6 +558,34 @@ run hcp_check_setup
 ```
 
 Green means you're done.
+
+### "I can't delete the old folder"
+
+Almost always a **`.venv`** folder inside it that won't go. That folder is the
+Python environment, and something still has it open — nearly always Claude
+Desktop, which is running the connector from it.
+
+1. **Fully quit Claude Desktop.** `Cmd + Q` on Mac; on Windows right-click the
+   Claude icon in the system tray (bottom right, possibly behind the `^`) and
+   choose **Quit**. Closing the window is not enough — that's the whole problem.
+2. **Close every Terminal / PowerShell window**, especially any sitting inside
+   that folder.
+3. Delete the folder again.
+
+Still stuck on **Windows**? Something else has a handle on it:
+
+- Close any editor or File Explorer window showing the folder, then retry.
+- If it still refuses, restart the computer and delete it before opening Claude.
+  That clears every handle and takes less time than hunting for the culprit.
+
+On **Mac**, if Finder says the folder is in use, quit Claude, then in Terminal:
+
+```bash
+rm -rf ~/Documents/HCP_MCP/.venv
+```
+
+(substituting your own folder). You do not need to preserve `.venv` — it's
+rebuilt automatically the next time the wizard or Claude runs.
 
 ### If you installed before September 2026
 
@@ -595,8 +640,9 @@ the file to Claude and ask it to check.
 
 **"HTTP 401" or "403"**
 Your key is wrong, was deleted, or your plan doesn't include API access. Generate a
-fresh one: **My Apps → Go to App Store → search "API" → API Key Management →
-Generate a new API key**, then update it in the Claude settings file from Step 5.
+fresh one: **9-box app button (top right) → Go to App Store → search "API" →
+API Key Management → Generate a new API key**, then update it in the Claude
+settings file from Step 5.
 
 **"HTTP 429" or fewer jobs than expected**
 Housecall Pro is limiting how fast we can ask. It retries automatically, and if it

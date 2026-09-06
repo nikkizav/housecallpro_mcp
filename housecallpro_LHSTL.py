@@ -29,6 +29,19 @@ from shared import api_request, BASE_URL, get_headers
 
 mcp = FastMCP("Housecall Pro LHSTL")
 
+# ── Version ────────────────────────────────────────────────────────────────────
+# Bumped on every release. setup_wizard stamps it into config.json, and
+# hcp_check_setup compares the two so a partner can see at a glance whether the
+# code they are running and the config they built still match.
+def _read_version() -> str:
+    try:
+        return (Path(__file__).parent / "VERSION").read_text(encoding="utf-8").strip()
+    except Exception:
+        return "unknown"
+
+
+VERSION = _read_version()
+
 # ── Load company config ────────────────────────────────────────────────────────
 
 _HERE = Path(__file__).parent
@@ -5486,7 +5499,8 @@ async def hcp_check_setup() -> str:
     account, so a config copied from another company will look valid but match
     nothing here — this tool catches exactly that.
     """
-    lines = ["╔══ SETUP CHECK ═══════════════════════════════════════════════"]
+    lines = ["╔══ SETUP CHECK ═══════════════════════════════════════════════",
+             f"║  Version {VERSION}"]
     problems: list[str] = []
     advice: list[str] = []
 
@@ -5501,7 +5515,7 @@ async def hcp_check_setup() -> str:
             if "401" in err or "403" in err:
                 advice.append(
                     "Check HOUSECALL_PRO_API_KEY. Generate a fresh key in Housecall "
-                    "Pro: My Apps (nine-squares icon by Settings) > Go to App Store "
+                    "Pro: the 9-box app button at TOP RIGHT > Go to App Store "
                     "> search 'API' > API Key Management > Generate a new API key. "
                     "Needs the MAX plan."
                 )
@@ -5526,6 +5540,14 @@ async def hcp_check_setup() -> str:
                       "(discovers your team + pipeline IDs and writes config.json)")
 
     cfg = _load_config()
+    built_with = str((cfg.get("_version") or cfg.get("version") or "")).strip()
+    if built_with and built_with != VERSION:
+        lines.append(f"║  ⚠ Config was built by version {built_with}, code is {VERSION}.")
+        advice.append("Re-run setup_wizard.py so the config matches this version — "
+                      "later versions sometimes add settings.")
+    elif not built_with:
+        lines.append(f"║  ⚠ Config predates version stamping — re-run setup_wizard.py "
+                     f"to record it.")
     company_cfg = (cfg.get("company") or {}).get("name")
     if company_cfg:
         lines.append(f"║    Configured company: {company_cfg}")
