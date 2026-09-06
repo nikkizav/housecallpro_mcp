@@ -366,6 +366,24 @@ def install_into_claude(cfg_dir: Path, api_key: str) -> tuple[bool, str]:
     servers = existing.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
+
+    # Earlier versions shipped 20 extra per-domain servers. They are gone now,
+    # so an install that registered them is left with entries pointing at files
+    # that no longer exist — Claude reports an error for each on every start.
+    # Clear out anything aimed at this project folder whose target is missing.
+    here = str(HERE.resolve())
+    stale = []
+    for name, entry in list(servers.items()):
+        if name == "housecallpro" or not isinstance(entry, dict):
+            continue
+        args = [str(a) for a in (entry.get("args") or [])]
+        targets = [a for a in args if a.endswith(".py")]
+        if not any(here in a for a in args + targets):
+            continue
+        if targets and not any(Path(t).is_file() for t in targets):
+            stale.append(name)
+    for name in stale:
+        del servers[name]
     replaced = "housecallpro" in servers
     servers["housecallpro"] = server_entry(api_key)
     existing["mcpServers"] = servers
@@ -373,10 +391,14 @@ def install_into_claude(cfg_dir: Path, api_key: str) -> tuple[bool, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
     others = [k for k in servers if k != "housecallpro"]
+    cleaned = (f"\n  removed {len(stale)} obsolete entr"
+               f"{'y' if len(stale) == 1 else 'ies'} pointing at files that no "
+               f"longer exist" if stale else "")
     return True, (
         f"{note}  wrote: {path}\n"
         f"  {'updated' if replaced else 'added'} the 'housecallpro' entry"
         + (f", kept {len(others)} other server(s) untouched" if others else "")
+        + cleaned
     )
 
 
@@ -385,11 +407,23 @@ async def main() -> int:
     print("  Housecall Pro MCP server — setup")
     print("=" * 66)
 
+    # An existing config means this is an update rather than a first install.
+    # Reuse its answers as the defaults so re-running is mostly pressing Enter,
+    # and nobody has to remember their own cost per tech-hour.
+    prior: dict = {}
     if CONFIG_PATH.exists():
-        print(f"\n{CONFIG_PATH.name} already exists.")
-        if not ask_yes("Overwrite it?", default=False):
+        try:
+            prior = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        except Exception:
+            prior = {}
+        label = prior.get("company", {}).get("name") or CONFIG_PATH.name
+        print(f"\nFound an existing setup for: {label}")
+        print("Re-running will rebuild it. Your previous answers are offered as")
+        print("defaults, so you can press Enter through anything unchanged.")
+        if not ask_yes("Continue?", default=True):
             print("Left it alone. Nothing changed.")
             return 0
+    prior_sched = prior.get("scheduling", {}) if isinstance(prior, dict) else {}
 
     key = os.environ.get("HOUSECALL_PRO_API_KEY", "")
     if key:
@@ -423,7 +457,8 @@ async def main() -> int:
     print("\n" + "─" * 66)
     print("Scheduling and cost settings")
     print("─" * 66)
-    default_cost = DEFAULTS["blended_cost_per_tech_hour"]
+    default_cost = float(prior_sched.get("blended_cost_per_tech_hour")
+                         or DEFAULTS["blended_cost_per_tech_hour"])
     if found["rates"]:
         costs = [r["hourly_cost"] / 100 for r in found["rates"]
                  if isinstance(r.get("hourly_cost"), int)]
@@ -439,10 +474,14 @@ async def main() -> int:
     print("\nThese next two work together. The difference between them is the")
     print("unpaid break subtracted from any day of 6 hours or more.")
     while True:
-        productive = ask_float("Productive hours per tech per day",
-                               DEFAULTS["productive_hours_per_day"])
-        window = ask_float("Booked appointment window per day (incl. break)",
-                           DEFAULTS["appointment_window_hours"])
+        productive = ask_float(
+            "Productive hours per tech per day",
+            float(prior_sched.get("productive_hours_per_day")
+                  or DEFAULTS["productive_hours_per_day"]))
+        window = ask_float(
+            "Booked appointment window per day (incl. break)",
+            float(prior_sched.get("appointment_window_hours")
+                  or DEFAULTS["appointment_window_hours"]))
         gap = window - productive
         print()
         if gap < 0:
@@ -468,12 +507,14 @@ async def main() -> int:
             "Fully-loaded cost per tech-hour ($)", default_cost),
         "capacity_target_hours_per_day": ask_float(
             "Team capacity target, tech-hours per day",
-            DEFAULTS["capacity_target_hours_per_day"]),
+            float(prior_sched.get("capacity_target_hours_per_day")
+                  or DEFAULTS["capacity_target_hours_per_day"])),
         "overtime_threshold_hours_per_day": ask_float(
             "Flag a day as overtime risk above (tech-hours)",
-            DEFAULTS["overtime_threshold_hours_per_day"]),
+            float(prior_sched.get("overtime_threshold_hours_per_day")
+                  or DEFAULTS["overtime_threshold_hours_per_day"])),
     }
-    tz = ask("Timezone", "America/Chicago")
+    tz = ask("Timezone", prior.get("company", {}).get("timezone") or "America/Chicago")
 
     cfg = build_config(found, team, sched, tz)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")

@@ -50,6 +50,7 @@ to think about it again.
 - [Set up a Project](#set-up-a-project-so-you-dont-repeat-yourself)
 - [What to ask](#what-to-ask)
 - [Reading the numbers](#reading-the-numbers) ← **the important section**
+- [Updating to a new version](#updating-to-a-new-version)
 - [When something goes wrong](#when-something-goes-wrong)
 - [Settings you should review](#settings-you-should-review)
 - [Safety](#safety)
@@ -346,12 +347,12 @@ you give up. Pick **Allow for this task** and it runs.
 The pop-up names the tool it wants to run, and the name tells you what it does:
 
 - **`hcp_list_…`, `hcp_get_…`, `hcp_time_variance`, `hcp_post_job_analysis`** —
-  these only look things up. 28 of the 45 tools are read-only. Nothing you approve
+  these only look things up. 32 of the 56 tools are read-only. Nothing you approve
   here can change anything.
 - **`hcp_create_…`, `hcp_update_…`, `hcp_delete_…`, `hcp_add_…`, `hcp_remove_…`,
   `hcp_set_…`, `hcp_write_estimate`, `hcp_finalize_estimate`,
   `hcp_approve_estimate_option`** — these **change your Housecall Pro data**. There
-  are 17 of them. Read what it says before allowing.
+  are 24 of them. Read what it says before allowing.
 
 If you asked a question and it wants to *change* something, that's worth a second
 look — say Deny and ask what it's trying to do.
@@ -484,6 +485,73 @@ Jobs it can't measure get listed by name and reason:
 
 That list is a coaching sheet. Fix the habits and those jobs become measurable next
 quarter.
+
+---
+
+## Updating to a new version
+
+Takes about five minutes. Same steps whichever version you're on.
+
+> **Before you touch anything:** your settings live in a file called
+> **`config.json`** inside the project folder — your team, your cost per hour,
+> your pipeline stages. Replacing the folder deletes it. Copy it to your Desktop
+> first and you can skip most of the questions later.
+
+**1. Save your settings**
+
+Open your project folder, find `config.json`, and copy it to your Desktop.
+(No `config.json`? You're on an old version that kept settings elsewhere — skip
+this, the wizard will rebuild them.)
+
+**2. Get the new version**
+
+Green **Code** button at the top of this page → **Download ZIP**. Unzip it, and
+replace your old project folder with the new one. Keep the same location and name
+if you can — that keeps the paths in your Claude settings valid.
+
+**3. Put your settings back**
+
+Copy `config.json` from your Desktop into the new folder, next to
+`setup_wizard.py`.
+
+**4. Re-run the wizard**
+
+```bash
+uv run python setup_wizard.py
+```
+
+It'll recognise your existing setup and offer your previous answers as defaults,
+so mostly you're pressing Enter. Say yes when it offers to update your Claude
+settings — that refreshes the file paths and clears out anything obsolete.
+
+**5. Fully quit Claude and reopen it**
+
+`Cmd + Q` on Mac, or right-click the tray icon → Quit on Windows. Then ask:
+
+```
+run hcp_check_setup
+```
+
+Green means you're done.
+
+### If you installed before September 2026
+
+Earlier versions registered **20 extra servers** alongside the main one. Those
+files no longer exist, so Claude will complain about each of them on startup, and
+it's what made Cowork time out connecting.
+
+The wizard clears them automatically in step 4 — it removes only entries pointing
+at files that are gone, and leaves your other tools alone. Nothing to do by hand.
+
+### Is updating worth it?
+
+Yes, if you've been running financial numbers. Versions before September 2026 read
+only the **first invoice** on each job. Since most jobs here carry a deposit and a
+final invoice, revenue was being understated — one $970 job reported $250 and
+showed a **-204% margin** on work that actually cleared 22%. Estimate filters also
+silently returned everything instead of filtering.
+
+Anything you analysed on an older version is worth re-running.
 
 ---
 

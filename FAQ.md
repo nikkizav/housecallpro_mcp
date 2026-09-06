@@ -123,7 +123,7 @@ lot of separate lookups — a month's time variance can be two hundred — so on
 
 The pop-up names the tool, and the name tells you what it does. Anything starting
 `hcp_list_` or `hcp_get_`, plus `hcp_time_variance` and `hcp_post_job_analysis`,
-only reads. That's 28 of the 45 tools. The 17 that can change something start with
+only reads. That's 32 of the 56 tools. The 24 that can change something start with
 `create`, `update`, `delete`, `add`, `remove`, `set`, `write`, `finalize` or
 `approve` — worth actually reading before you allow.
 
@@ -201,8 +201,18 @@ About 15 minutes, mostly waiting on downloads.
 
 **Do I need to keep it updated?**
 
-Not really. Re-run the setup wizard if you add or lose a tech, or if your labor
-cost changes. Then `run hcp_check_setup` to confirm.
+Worth doing when a new version goes out, because some fixes change the numbers
+rather than just adding features. Versions before September 2026 read only the
+first invoice on a job — and since most jobs have a deposit and a final invoice,
+that understated revenue badly. One $970 job reported $250 and a -204% margin on
+work that actually made money.
+
+Updating takes about five minutes: save your `config.json`, download the new
+version, put the file back, re-run the setup wizard, restart Claude. Full steps
+are in the README under "Updating to a new version."
+
+Also re-run the wizard (no download needed) if you add or lose a tech, or your
+labor cost changes. Then `run hcp_check_setup` to confirm.
 
 ---
 
