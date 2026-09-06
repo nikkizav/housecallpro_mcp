@@ -4689,8 +4689,28 @@ def _overhead_category(bucket: str, why: str) -> str:
 
 
 def _ledger_path() -> Path:
+    """Where the overhead ledger lives.
+
+    Precedence: HCP_OVERHEAD_LEDGER env var, then job_cost_import.ledger_path in
+    config.json, then beside the server.
+
+    Putting it in a Cowork project folder is worth doing: Cowork can then read it
+    for its own analysis, and — since it sits outside the project folder — it
+    survives replacing that folder on an update, which the default location does
+    not.
+    """
     override = os.environ.get("HCP_OVERHEAD_LEDGER")
-    return Path(override).expanduser() if override else (_HERE / "overhead_ledger.csv")
+    if override:
+        return Path(override).expanduser()
+    configured = ((_load_config().get("job_cost_import") or {})
+                  .get("ledger_path") or "").strip()
+    if configured:
+        target = Path(configured).expanduser()
+        # a directory means "put the standard filename in here"
+        if target.is_dir() or not target.suffix:
+            return target / "overhead_ledger.csv"
+        return target
+    return _HERE / "overhead_ledger.csv"
 
 
 def _ledger_existing_keys(path: Path) -> set:
@@ -4735,6 +4755,7 @@ def _append_overhead(vendor: str, entries: list[dict]) -> tuple[int, Path]:
         })
     if not fresh:
         return 0, path
+    path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not path.is_file()
     with open(path, "a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(_LEDGER_COLUMNS))
@@ -5388,8 +5409,8 @@ async def hcp_import_job_costs(
     ledger_written, ledger_path = _append_overhead(vendor, overhead_entries)
 
     if overhead_only:
-        lines.append(f"║  ✓ Recorded {ledger_written} non-job line(s) in "
-                     f"{ledger_path.name}.")
+        lines.append(f"║  ✓ Recorded {ledger_written} non-job line(s) in")
+        lines.append(f"║    {ledger_path}")
         lines.append(f"║  Nothing posted to jobs — overhead_only was set.")
         lines.append(f"║  {D(total_post)} of job materials was left alone.")
         lines.append(f"║  Read it with hcp_overhead_report.")
@@ -5423,8 +5444,8 @@ async def hcp_import_job_costs(
 
     lines.append(f"║  ✓ Posted {posted} material line(s), {D(total_post)} total.")
     if ledger_written:
-        lines.append(f"║  ✓ Recorded {ledger_written} non-job line(s) in "
-                     f"{ledger_path.name} — see hcp_overhead_report.")
+        lines.append(f"║  ✓ Recorded {ledger_written} non-job line(s) in")
+        lines.append(f"║    {ledger_path}")
     if failed:
         lines.append(f"║  ✗ Failed on {len(failed)} job(s): "
                      + ", ".join(f"#{n} ({e})" for n, e in failed))

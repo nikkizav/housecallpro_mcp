@@ -673,6 +673,28 @@ computer once — that reliably fixes it.
 
 ## Settings you should review
 
+### Where the overhead ledger goes
+
+Every line an import decides is **not** a job cost — tools, van stock, equipment,
+food, purchases with no job on the receipt — is appended to a CSV. By default
+that sits beside the server, which has two drawbacks: nothing else can read it,
+and it is lost if you replace the folder during an update.
+
+Point it somewhere better in `config.json`:
+
+```json
+"job_cost_import": {
+  "ledger_path": "/Users/you/Documents/Claude/Projects/Your Project"
+}
+```
+
+Give it a **folder** and `overhead_ledger.csv` is created inside. Put it in a
+Cowork project folder and Cowork can analyse it directly — what is being bought,
+by whom, how fast tools are going through — and it survives updates because it
+is outside the server folder.
+
+
+
 The setup wizard fills these in, but two are worth a second look. They're in
 `config.json` in the project folder, or just ask Claude to explain them.
 
