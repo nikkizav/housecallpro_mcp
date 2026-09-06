@@ -418,7 +418,8 @@ Where are we overbooked in the next four weeks?
 **Material costs from supplier receipts**
 ```
 Import the Home Depot purchase history from my Downloads folder.
-(review the preview, then)
+(read the preview — consumables it wasn't sure about are listed separately)
+Those blades were all for the jobs — import again treating supplies as job costs.
 Post it for real.
 ```
 

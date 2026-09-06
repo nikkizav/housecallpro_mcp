@@ -4649,6 +4649,20 @@ async def hcp_get_estimate_attachments(estimate_id: str) -> str:
 # safe — but that is also why a second run would double everything, hence the
 # receipt marker written into each description.
 
+# Three tiers, because the item alone often cannot decide. A drill bit is a job
+# material when it was bought for that job and van stock when it was bought to
+# keep the truck running — same SKU, different answer. So:
+#   VAN STOCK   things that are basically always restock, whatever the receipt says
+#   AMBIGUOUS   genuinely could be either — never guessed, routed to you
+#   everything else falls through to being a job material
+# Both lists are overridable per company in config.json.
+_VAN_STOCK_WORDS = ("glove", "trash bag", "contractor bag", "rag ", "rags",
+                    "micro twl", "towel", "broom", "sweep", "pencil",
+                    "permanent marker", "jobsite marker")
+_AMBIGUOUS_WORDS = ("blade", "drill bit", " bit ", "bit set", "sanding",
+                    "abrasive", "sandpaper", "disc", "sponge", "tape",
+                    "liner", "brush", "roller", "shim", "bucket", "pail")
+
 _TOOL_CLASSES = {"PORTABLE POWER", "WET DRY VACS"}
 _TOOL_WORDS = ("combo kit", "starter kit", "rotary hammer", "impact driver",
                "circular saw", "miter saw", "table saw", "nail gun", "nailer",
@@ -4737,7 +4751,10 @@ def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
     return rows, vendor
 
 
-def _classify(row: dict, tool_threshold: float) -> tuple[str, str]:
+def _classify(row: dict, tool_threshold: float,
+              supplies: str = "review",
+              always_job: tuple = (), always_general: tuple = ()
+              ) -> tuple[str, str]:
     """(bucket, why) — bucket is 'job', 'general', 'skip' or 'review'."""
     desc = _pick(row, "desc")
     low = desc.lower()
@@ -4764,6 +4781,21 @@ def _classify(row: dict, tool_threshold: float) -> tuple[str, str]:
     if job in _NON_JOB_LABELS:
         label = job or "blank"
         return "general", f"no job on the receipt (job field = {label})"
+
+    # Company-specific pins beat everything below.
+    if any(w and w in low for w in always_job):
+        return "job", ""
+    if any(w and w in low for w in always_general):
+        return "general", "van stock (your rule)"
+
+    if any(w in low for w in _VAN_STOCK_WORDS):
+        return "general", "van stock — restocked regardless of job"
+    if any(w in low for w in _AMBIGUOUS_WORDS):
+        if supplies == "job":
+            return "job", ""
+        if supplies == "general":
+            return "general", "consumable, treated as van stock this run"
+        return "review", "job material or van stock? same item can be either"
     return "job", ""
 
 def _receipt_marker(vendor: str, m: dict) -> str:
@@ -4780,6 +4812,7 @@ async def hcp_import_job_costs(
     tool_threshold: Optional[float] = 150.0,
     only_jobs: Optional[str] = None,
     vendor_label: Optional[str] = None,
+    supplies: Optional[str] = "review",
 ) -> str:
     """
     Post material actuals onto jobs from a supplier purchase export.
@@ -4800,8 +4833,15 @@ async def hcp_import_job_costs(
                    tool_threshold, and anything bought to van/shop stock or
                    with no job on the receipt. Reported, never posted.
       • SKIPPED  — food and drink, $0 bundle components, delivery fees.
-      • REVIEW   — small tools that could be either. Reported, never posted;
-                   decide and enter those by hand.
+      • REVIEW   — consumables that could be either: blades, drill bits,
+                   sandpaper, tape, brushes, buckets. The same drill bit is a
+                   job material when it was bought for that job and van stock
+                   when it was bought to keep the truck running, so these are
+                   never guessed. Use supplies= to route them in bulk.
+
+    Gloves, trash bags, rags, markers and brooms are treated as van stock
+    outright — they get restocked whatever the receipt says. Pin your own
+    exceptions in config.json under job_cost_import.
 
     Returns are netted against purchases of the same item on the same job, so a
     buy-and-return pair cancels instead of inflating the job.
@@ -4816,6 +4856,10 @@ async def hcp_import_job_costs(
                         overhead rather than a job cost (default 150)
         only_jobs: Comma-separated job numbers to limit the import to
         vendor_label: Override the supplier name recorded on each line
+        supplies: What to do with the ambiguous consumables —
+                  'review' (default, decide yourself), 'job' (this receipt's
+                  consumables were bought for the jobs), or 'general' (they
+                  were van restock)
     """
     try:
         rows, detected_vendor = _read_receipt_csv(csv_path)
@@ -4827,12 +4871,19 @@ async def hcp_import_job_costs(
         return f"❌ No data rows found in {csv_path}."
 
     vendor = (vendor_label or detected_vendor or "Supplier").strip()
-    threshold = float(tool_threshold if tool_threshold is not None else 150.0)
+    cfg_imp = (_load_config().get("job_cost_import") or {})
+    threshold = float(tool_threshold if tool_threshold is not None
+                      else cfg_imp.get("tool_threshold_dollars", 150.0))
+    route = (supplies or "review").strip().lower()
+    if route not in ("review", "job", "general"):
+        return "supplies must be 'review', 'job' or 'general'."
+    always_job = tuple(w.lower() for w in (cfg_imp.get("always_job_keywords") or []))
+    always_gen = tuple(w.lower() for w in (cfg_imp.get("always_general_keywords") or []))
     wanted = {j.strip().upper() for j in (only_jobs or "").split(",") if j.strip()}
 
     buckets: dict[str, list[dict]] = {"job": [], "general": [], "skip": [], "review": []}
     for r in rows:
-        bucket, why = _classify(r, threshold)
+        bucket, why = _classify(r, threshold, route, always_job, always_gen)
         buckets[bucket].append({"row": r, "why": why})
 
     # ── net returns against purchases, per job + item ────────────────────────
@@ -4963,7 +5014,8 @@ async def hcp_import_job_costs(
     _section("NOT A JOB COST (overhead)", buckets["general"],
              "Tools and van/shop stock. Book these to overhead, not to a job.")
     _section("NEEDS YOUR CALL", buckets["review"],
-             "Small tools — job cost or shop stock? Enter by hand if they belong.")
+             "Could be job materials or van restock. Re-run with supplies='job' "
+             "or supplies='general' to route them all, or pin rules in config.")
     _section("IGNORED", buckets["skip"])
 
     if cancelled:

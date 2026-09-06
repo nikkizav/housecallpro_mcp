@@ -198,6 +198,21 @@
         "Line Total",
         "Amount"
       ]
-    }
+    },
+    "always_general_keywords": [
+      "glove",
+      "trash bag",
+      "contractor bag",
+      "rag",
+      "towel",
+      "broom",
+      "pencil",
+      "permanent marker"
+    ],
+    "_always_general_note": "Always van stock, whatever the receipt says \u2014 these get restocked and reused. Matched as lowercase substrings of the item description.",
+    "always_job_keywords": [],
+    "_always_job_note": "Always a job material, overriding everything else. Add items you have decided once and do not want asked about again.",
+    "_ambiguous_note": "Blades, drill bits, sandpaper, tape, brushes, buckets and similar are deliberately NOT guessed \u2014 the same drill bit is a job material when bought for that job and van stock when bought to restock the truck. They go to a review list. Route them in bulk with supplies='job' or supplies='general' on the import, or move specific ones into the two lists above once you have decided.",
+    "_reuse_note": "Leftovers that go back on the van (half a can of primer, say) are not tracked. The whole purchase stays on the job it was bought for, which slightly overstates that job and understates the next one that uses the remainder."
   }
 }
