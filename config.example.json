@@ -223,6 +223,21 @@
       "Sherwin-Williams: puts the order's PO and date on the FIRST line of each invoice only; later lines are blank and are carried down, matched on Invoice Number.",
       "Lowe's: job is the PO Number, and '00' means no job. Snacks and coffee sit under sub category FRONT END AND CONVENIENCE.",
       "Category words are matched as substrings across department/class/subclass together, because each supplier files food in a different column."
-    ]
+    ],
+    "equipment_keywords": [
+      "fan",
+      "heater",
+      "dehumidifier",
+      "blower",
+      "air mover",
+      "extension cord",
+      "work light",
+      "generator",
+      "shop vac",
+      "wet/dry vac",
+      "sawhorse",
+      "ladder"
+    ],
+    "_equipment_note": "Things you own and keep using. Overhead at ANY price \u2014 the tool threshold does not apply, because a $70 floor fan is shop equipment for the same reason a $700 one is. This is about what the item IS, not what it cost."
   }
 }

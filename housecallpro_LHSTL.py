@@ -4662,8 +4662,16 @@ _VAN_STOCK_WORDS = ("glove", "trash bag", "contractor bag", "rag ", "rags",
 _AMBIGUOUS_WORDS = ("blade", "drill bit", " bit ", "bit set", "sanding",
                     "abrasive", "sandpaper", "disc", "sponge", "tape",
                     "liner", "brush", "roller", "shim", "bucket", "pail",
-                    "caulk gun", "fan", "heater", "dehumidifier", "blower",
-                    "extension cord", "drop cloth", "tarp")
+                    "caulk gun", "drop cloth", "tarp")
+
+# Equipment you own and keep using. Not a job cost at ANY price — a $70 floor
+# fan is shop equipment for the same reason a $700 one is, so the tool
+# threshold does not apply here. This is about what the thing IS, not what it
+# cost.
+_EQUIPMENT_WORDS = ("fan", "heater", "dehumidifier", "blower", "air mover",
+                    "extension cord", "work light", "worklight", "generator",
+                    "shop vac", "wet/dry vac", "sawhorse", "ladder",
+                    "space heater")
 
 _TOOL_CLASSES = {"PORTABLE POWER", "WET DRY VACS"}
 _TOOL_WORDS = ("combo kit", "starter kit", "rotary hammer", "impact driver",
@@ -4857,6 +4865,8 @@ def _classify(row: dict, tool_threshold: float,
     if any(w and w in low for w in always_general):
         return "general", "van stock (your rule)"
 
+    if any(w in low for w in _EQUIPMENT_WORDS):
+        return "general", f"equipment you keep — overhead at any price (${amount:,.2f})"
     if any(w in low for w in _VAN_STOCK_WORDS):
         return "general", "van stock — restocked regardless of job"
     if any(w in low for w in _AMBIGUOUS_WORDS):
