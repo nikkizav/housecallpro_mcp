@@ -4648,6 +4648,101 @@ async def hcp_get_estimate_attachments(estimate_id: str) -> str:
     return "\n".join(lines)
 
 
+# ── Overhead ledger ────────────────────────────────────────────────────────────
+#
+# Everything a receipt import decides is NOT a job cost still happened, and it is
+# real money. It is recorded here rather than anywhere in Housecall Pro.
+#
+# Why not a dummy job: a fake job appears in every job list, drags portfolio
+# margin (all cost, no revenue), needs a fake customer, and has to be excluded by
+# hand from every report forever. It corrupts the thing we just spent this long
+# making trustworthy.
+#
+# Why not a database: this is an append-only list of purchases. A CSV is
+# readable, diffable, openable in Excel, and needs no maintenance.
+#
+# This is for OPERATIONAL analysis — what is being bought, by whom, how the mix
+# shifts. The system of record for the expense itself is your accounting
+# software, which already receives these card transactions.
+
+_LEDGER_COLUMNS = ("date", "vendor", "receipt", "category", "reason",
+                   "description", "sku", "quantity", "amount",
+                   "purchaser", "job_on_receipt")
+
+
+def _overhead_category(bucket: str, why: str) -> str:
+    """Stable bucket name for reporting, from the classifier's reason."""
+    w = why.lower()
+    if "tool purchase" in w:
+        return "tools"
+    if "equipment" in w:
+        return "equipment"
+    if "van stock" in w:
+        return "van stock"
+    if "no job" in w or "no usable job" in w:
+        return "no job on receipt"
+    if "food" in w:
+        return "food and drink"
+    if "fee" in w or "$0" in w:
+        return "fees and zero-value"
+    return "unclassified" if bucket == "general" else bucket
+
+
+def _ledger_path() -> Path:
+    override = os.environ.get("HCP_OVERHEAD_LEDGER")
+    return Path(override).expanduser() if override else (_HERE / "overhead_ledger.csv")
+
+
+def _ledger_existing_keys(path: Path) -> set:
+    if not path.is_file():
+        return set()
+    keys = set()
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                keys.add((row.get("vendor", ""), row.get("receipt", ""),
+                          row.get("sku", ""), row.get("description", "")))
+    except Exception:
+        pass
+    return keys
+
+
+def _append_overhead(vendor: str, entries: list[dict]) -> tuple[int, Path]:
+    """Append non-job lines, skipping any already recorded. Returns (written, path)."""
+    path = _ledger_path()
+    seen = _ledger_existing_keys(path)
+    fresh = []
+    for e in entries:
+        r = e["row"]
+        desc = _pick(r, "desc")[:120]
+        sku = _pick(r, "sku")
+        receipt = _pick(r, "receipt")
+        if (vendor, receipt, sku, desc) in seen:
+            continue
+        seen.add((vendor, receipt, sku, desc))
+        fresh.append({
+            "date": _norm_date(_pick(r, "date")),
+            "vendor": vendor,
+            "receipt": receipt,
+            "category": _overhead_category(e.get("bucket", "general"), e["why"]),
+            "reason": e["why"],
+            "description": desc,
+            "sku": sku,
+            "quantity": _pick(r, "qty") or "1",
+            "amount": f"{abs(_money(_pick(r, 'amount'))):.2f}",
+            "purchaser": _pick(r, "purchaser"),
+            "job_on_receipt": _pick(r, "job"),
+        })
+    if not fresh:
+        return 0, path
+    is_new = not path.is_file()
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(_LEDGER_COLUMNS))
+        if is_new:
+            writer.writeheader()
+        writer.writerows(fresh)
+    return len(fresh), path
+
 # ── Supplier receipt import ────────────────────────────────────────────────────
 #
 # Posting material actuals onto jobs, from a supplier purchase export.
@@ -4738,6 +4833,36 @@ _COL_ALIASES = {
     "receipt":    ("Invoice Number", "Order Number", "Transaction ID",
                    "Receipt", "Receipt Number"),
 }
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
+def _norm_date(raw: str) -> str:
+    """Any supplier's date -> YYYY-MM-DD, or '' if it cannot be read.
+
+    Home Depot and Sherwin-Williams write ISO. Lowe's writes 04-Sep-2026, which
+    sorts and slices wrongly against the others — it made a ledger spanning both
+    read as "02-Sep-202 to 2026-09-04" and broke the date filter.
+    """
+    t = (raw or "").strip()[:24]
+    if not t:
+        return ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t[:10]):
+        return t[:10]
+    m = re.fullmatch(r"(\d{1,2})[-/ ]([A-Za-z]{3,})[-/ ](\d{4})", t)
+    if m:
+        mon = _MONTHS.get(m.group(2)[:3].lower())
+        if mon:
+            return f"{m.group(3)}-{mon:02d}-{int(m.group(1)):02d}"
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", t)
+    if m:
+        y = int(m.group(3))
+        y += 2000 if y < 100 else 0
+        return f"{y}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return t[:10]
 
 
 def _word_hit(text: str, words) -> bool:
@@ -5001,7 +5126,7 @@ async def hcp_import_job_costs(
     buckets: dict[str, list[dict]] = {"job": [], "general": [], "skip": [], "review": []}
     for r in rows:
         bucket, why = _classify(r, threshold, route, always_job, always_gen)
-        buckets[bucket].append({"row": r, "why": why})
+        buckets[bucket].append({"row": r, "why": why, "bucket": bucket})
 
     # ── net returns against purchases, per job + item ────────────────────────
     merged: dict[tuple, dict] = {}
@@ -5024,8 +5149,8 @@ async def hcp_import_job_costs(
         m["qty"] += qty * sign
         m["lines"] += 1
         m["returned" if amount < 0 else "bought"] += 1
-        if d := _pick(r, "date"):
-            m["dates"].add(d[:10])
+        if d := _norm_date(_pick(r, "date")):
+            m["dates"].add(d)
         if rc := _pick(r, "receipt"):
             m["receipts"].add(rc)
         if b := _pick(r, "purchaser"):
@@ -5229,8 +5354,11 @@ async def hcp_import_job_costs(
     # ── post ─────────────────────────────────────────────────────────────────
     lines.append(f"╠══════════════════════════════════════════════════════════════")
     if dry_run:
+        oh = sum(abs(_money(_pick(e["row"], "amount")))
+                 for e in buckets["general"] + buckets["skip"])
         lines += [
-            f"║  Would post {D(total_post)} to {len([n for n in by_job if n in lookup])} job(s).",
+            f"║  Would post {D(total_post)} to {len([n for n in by_job if n in lookup])} job(s),",
+            f"║  and record {D(oh)} of non-job spend in the overhead ledger.",
             f"║",
             f"║  Read the lists above first. Job materials CANNOT be deleted",
             f"║  once posted — a mistake can only be zeroed out, not removed.",
@@ -5239,6 +5367,11 @@ async def hcp_import_job_costs(
             f"╚{'═' * 61}",
         ]
         return "\n".join(lines)
+
+    # Everything that is NOT going on a job still happened — record it before
+    # posting, so the two halves of the receipt stay together.
+    overhead_entries = buckets["general"] + buckets["skip"]
+    ledger_written, ledger_path = _append_overhead(vendor, overhead_entries)
 
     posted, failed = 0, []
     for num, job in lookup.items():
@@ -5266,6 +5399,9 @@ async def hcp_import_job_costs(
             failed.append((num, f"{type(e).__name__}"))
 
     lines.append(f"║  ✓ Posted {posted} material line(s), {D(total_post)} total.")
+    if ledger_written:
+        lines.append(f"║  ✓ Recorded {ledger_written} non-job line(s) in "
+                     f"{ledger_path.name} — see hcp_overhead_report.")
     if failed:
         lines.append(f"║  ✗ Failed on {len(failed)} job(s): "
                      + ", ".join(f"#{n} ({e})" for n, e in failed))
@@ -5482,6 +5618,124 @@ async def hcp_job_financials(
         f"║    model measured them, otherwise scheduled — check the grade column.",
         f"║    ⚠ on a row means collected + owed ≠ contract value.",
         f"╚{'═'*61}",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hcp_overhead_report(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    group_by: Optional[str] = "category",
+    compare_to_revenue: Optional[bool] = True,
+) -> str:
+    """
+    Everything bought that did NOT go on a job — tools, van stock, equipment,
+    food, and purchases with no job on the receipt.
+
+    Reads the overhead ledger that hcp_import_job_costs writes each time it runs
+    for real. Nothing appears here until you have imported at least one supplier
+    receipt with dry_run=False.
+
+    This is for seeing the shape of your non-job spend — what it is, who is
+    buying it, how it moves — not for bookkeeping. The expense itself belongs in
+    your accounting software, which already receives these card transactions.
+
+    Args:
+        start_date: First day, YYYY-MM-DD (default: everything)
+        end_date: Last day, YYYY-MM-DD
+        group_by: category | purchaser | vendor | month
+        compare_to_revenue: Show it as a share of job revenue in the same window
+    """
+    path = _ledger_path()
+    if not path.is_file():
+        return (f"No overhead ledger yet at {path}.\n\n"
+                f"It is written the first time you run hcp_import_job_costs with "
+                f"dry_run=False — a preview does not record anything.")
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            rows = [r for r in csv.DictReader(fh)]
+    except Exception as e:
+        return f"❌ Could not read {path}: {type(e).__name__}: {e}"
+
+    lo = (start_date or "0000-00-00")[:10]
+    hi = (end_date or "9999-99-99")[:10]
+    rows = [r for r in rows if lo <= (r.get("date") or "")[:10] <= hi]
+    if not rows:
+        return (f"Nothing in the overhead ledger between {start_date or 'the start'} "
+                f"and {end_date or 'now'}.")
+
+    amt = lambda r: _money(r.get("amount"))
+    total = sum(amt(r) for r in rows)
+    dates = sorted((r.get("date") or "") for r in rows if r.get("date"))
+    span = f"{dates[0]} to {dates[-1]}" if dates else "all time"
+
+    keymap = {"category": "category", "purchaser": "purchaser",
+              "vendor": "vendor", "month": None}
+    key = (group_by or "category").strip().lower()
+    if key not in keymap:
+        return "group_by must be category, purchaser, vendor or month."
+
+    groups: dict[str, list] = {}
+    for r in rows:
+        k = ((r.get("date") or "")[:7] if key == "month"
+             else (r.get(keymap[key]) or "—"))
+        groups.setdefault(k, []).append(r)
+
+    D = lambda v: f"${v:,.2f}"
+    lines = [
+        f"╔══ NON-JOB SPEND — {span} ═════════════════════",
+        f"║  {len(rows)} line(s)   {D(total)}   grouped by {key}",
+        f"╠══════════════════════════════════════════════════════════════",
+        f"║  {key.title():<26}{'lines':>7}{'amount':>13}{'share':>8}",
+    ]
+    for k in sorted(groups, key=lambda k: -sum(amt(r) for r in groups[k])):
+        g = groups[k]
+        gt = sum(amt(r) for r in g)
+        lines.append(f"║  {k[:25]:<26}{len(g):>7}{D(gt):>13}"
+                     f"{gt / total * 100 if total else 0:>7.0f}%")
+
+    # biggest single items — usually where the money actually is
+    big = sorted(rows, key=amt, reverse=True)[:8]
+    if big:
+        lines.append(f"╠══ LARGEST ITEMS ═════════════════════════════════════════════")
+        for r in big:
+            lines.append(f"║  {D(amt(r)):>10}  {(r.get('date') or '')[:10]}  "
+                         f"{(r.get('description') or '')[:38]:<40}"
+                         f"{(r.get('purchaser') or '')[:14]}")
+
+    if compare_to_revenue and dates:
+        try:
+            data = await api_request("GET", "/jobs", params={
+                "scheduled_start_min": f"{dates[0]}T00:00:00Z",
+                "scheduled_start_max": f"{dates[-1]}T23:59:59Z",
+                "page": 1, "page_size": 100})
+            revenue = sum(_as_int(j.get("total_amount"), 0)
+                          for j in data.get("jobs", [])) / 100
+            if revenue > 0:
+                lines += [
+                    f"╠══ AGAINST REVENUE ═══════════════════════════════════════════",
+                    f"║  Job revenue in the same window: {D(revenue)}",
+                    f"║  Non-job spend is {total / revenue * 100:.1f}% of it.",
+                ]
+                tools = sum(amt(r) for r in rows
+                            if r.get("category") in ("tools", "equipment"))
+                if tools:
+                    lines.append(
+                        f"║  Of which {D(tools)} is tools and equipment — lumpy by"
+                    )
+                    lines.append(
+                        f"║  nature, so judge it over quarters rather than weeks."
+                    )
+        except Exception:
+            lines.append(f"║  (could not fetch revenue for comparison)")
+
+    lines += [
+        f"╠══════════════════════════════════════════════════════════════",
+        f"║  Ledger: {path}",
+        f"║  ℹ Operational view only. The expense itself belongs in your",
+        f"║    accounting software, which already sees these card charges.",
+        f"╚{'═' * 61}",
     ]
     return "\n".join(lines)
 

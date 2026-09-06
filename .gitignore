@@ -31,3 +31,6 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+# overhead ledger — your own spend record, not for sharing
+overhead_ledger.csv

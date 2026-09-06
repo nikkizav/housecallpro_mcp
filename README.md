@@ -438,6 +438,13 @@ Those blades were all for the jobs — import again treating supplies as job cos
 Post it for real.
 ```
 
+**Spend that isn't on a job**
+```
+Show me the non-job spend for August.
+Group the overhead report by purchaser.
+How much are we spending on tools versus van stock?
+```
+
 **Money**
 ```
 Run job financials for last month.
@@ -700,7 +707,7 @@ Added or lost a tech? Re-run the setup wizard, then `hcp_check_setup`.
 
 Everything below is optional.
 
-**Architecture.** One server, `housecallpro_LHSTL.py`, with 57 tools returning
+**Architecture.** One server, `housecallpro_LHSTL.py`, with 58 tools returning
 formatted, readable output. There is nothing else to register.
 
 Earlier versions shipped 20 additional per-domain servers returning raw JSON.
