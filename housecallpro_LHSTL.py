@@ -449,6 +449,73 @@ def _day_skeleton(job: dict, appts: list[dict]) -> tuple[list[dict], str]:
     return [], "job_schedule_multiday"
 
 
+def _job_money(job: dict, inv_data: Any) -> dict:
+    """Every money figure for one job, from ALL of its invoices.
+
+    Most jobs carry two invoices (a deposit and a final) and some carry three.
+    Reading only the first reported the deposit as the whole job — one $970 job
+    came back as $250 of revenue against $760 of labor, i.e. -204% margin.
+
+    It also invented discounts. `subtotal` on an invoice is the JOB's line-item
+    subtotal rather than that invoice's charge, so `subtotal - amount` on a
+    deposit invoice produces a fake discount the size of the unbilled remainder.
+    Real discounts live in `discounts[]`, restated on each invoice — so take
+    them from the newest one rather than summing across.
+
+    The job record is authoritative for contract value and what is still owed;
+    invoices need not cover the whole job yet, and that gap is unbilled work
+    rather than an unpaid balance.
+    """
+    if isinstance(inv_data, list):
+        invoices = inv_data
+    else:
+        inv_data = inv_data or {}
+        invoices = inv_data.get("invoices") or (
+            [inv_data] if inv_data.get("id") else [])
+    invoices = [i for i in invoices if isinstance(i, dict)]
+
+    def _num(i: dict) -> tuple:
+        try:
+            return (1, int(i.get("invoice_number") or 0))
+        except (TypeError, ValueError):
+            return (0, 0)
+
+    latest = sorted(invoices, key=_num)[-1] if invoices else {}
+
+    discounts = [d for d in (latest.get("discounts") or []) if isinstance(d, dict)]
+    payments = [p for i in invoices for p in (i.get("payments") or [])
+                if isinstance(p, dict)]
+    ok_pay = [p for p in payments if p.get("status") == "succeeded"]
+
+    contract = _as_int(job.get("total_amount"), 0)
+    invoiced = sum(int(i.get("amount") or 0) for i in invoices)
+    collected = sum(int(p.get("amount") or 0) for p in ok_pay)
+    outstanding = _as_int(job.get("outstanding_balance"), 0)
+    dates = sorted((p.get("paid_at") or "")[:10] for p in ok_pay if p.get("paid_at"))
+
+    return {
+        "invoices": invoices,
+        "latest": latest,
+        "status": latest.get("status") or "unknown",
+        "gross_subtotal": int(latest.get("subtotal") or 0),
+        "discount": sum(abs(int(d.get("amount") or 0)) for d in discounts),
+        "discount_names": ", ".join(d.get("name") or "discount" for d in discounts),
+        "contract": contract,
+        "invoiced": invoiced,
+        "unbilled": max(0, contract - invoiced),
+        "collected": collected,
+        "outstanding": outstanding,
+        "invoiced_unpaid": sum(int(i.get("due_amount") or 0) for i in invoices),
+        "surcharges": sum(int(p.get("surcharge_fee_amount") or 0) for p in ok_pay),
+        "payments": ok_pay,
+        "methods": ", ".join(sorted({p.get("payment_method") or "—" for p in ok_pay})) or "—",
+        "last_paid": dates[-1] if dates else "",
+        # collected + still owed should equal the contract; when it does not, a
+        # payment usually has not settled yet
+        "reconciles": (collected + outstanding == contract) or not contract,
+    }
+
+
 def _estimate_job_time(job: dict, appts: list[dict], line_items: list[dict],
                        tm: dict) -> dict:
     """Quoted / scheduled / actual tech-hours for one job, with a confidence grade.
@@ -3463,38 +3530,35 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     base_rev   = sum(int(i.get("amount") or 0) for i in base_labor)
     base_hrs   = sum(float(i.get("quantity") or 0) for i in base_labor)
 
-    # ── Invoice ───────────────────────────────────────────────────────────────
-    # invoice endpoint returns list or object depending on version
-    if isinstance(inv_data, list):
-        inv = inv_data[0] if inv_data else {}
-    else:
-        inv = inv_data.get("invoice") or inv_data.get("invoices", [{}])[0] if "invoices" in inv_data else inv_data
+    # ── Money: every invoice on the job (see _job_money) ─────────────────────
+    _m = _job_money(job_data, inv_data)
+    invoices        = _m["invoices"]
+    contract_value  = _m["contract"]
+    outstanding     = _m["outstanding"]
+    gross_subtotal  = _m["gross_subtotal"]
+    discount_total  = _m["discount"]
+    discount_names  = _m["discount_names"]
+    invoiced        = _m["invoiced"]
+    unbilled        = _m["unbilled"]
+    invoiced_unpaid = _m["invoiced_unpaid"]
+    collected       = _m["collected"]
+    surcharges      = _m["surcharges"]
+    ok_payments     = _m["payments"]
+    pay_methods     = _m["methods"]
+    last_pay_date   = _m["last_paid"]
+    inv_status      = _m["status"]
 
-    # HCP invoice keys: subtotal → "subtotal", total → "amount", balance → "due_amount"
-    inv_subtotal  = int(inv.get("subtotal") or 0)
-    inv_total     = int(inv.get("amount")   or 0)
-    inv_discount  = inv_subtotal - inv_total if inv_subtotal > inv_total else 0
-    inv_balance   = int(inv.get("due_amount") or 0)
-    inv_status    = inv.get("status") or "unknown"
-
-    payments      = inv.get("payments") or []
-    if not isinstance(payments, list):
-        payments = []
-    pay_method    = payments[0].get("payment_method", "—") if payments else "—"
-    pay_date      = (payments[0].get("paid_at") or payments[0].get("created_at") or "")[:10] if payments else ""
     completed_date = (completed_at or "")[:10]
-    days_to_pay   = ""
-    if completed_date and pay_date:
+    days_to_pay = ""
+    if completed_date and last_pay_date:
         from datetime import date
         try:
-            d1 = date.fromisoformat(completed_date)
-            d2 = date.fromisoformat(pay_date)
-            days_to_pay = str((d2 - d1).days)
+            days_to_pay = str((date.fromisoformat(last_pay_date)
+                               - date.fromisoformat(completed_date)).days)
         except Exception:
             pass
 
-    # Use invoice total as authoritative revenue (reflects discounts)
-    revenue = inv_total if inv_total > 0 else (labor_rev + mat_rev)
+    revenue = contract_value if contract_value > 0 else (labor_rev + mat_rev)
 
     # ── Appointments → scheduled tech-hours ───────────────────────────────────
     appts = appt_data.get("appointments") or []
@@ -3544,10 +3608,23 @@ async def hcp_post_job_analysis(job_id: str) -> str:
     gross_profit = (revenue / 100) - total_cost
     margin_pct   = (gross_profit / (revenue / 100) * 100) if revenue > 0 else 0.0
 
+    # ── Labor vs materials, each side separately ──────────────────────────────
+    # Revenue split comes from line-item `kind`; cost split from the time model
+    # (labor) and either the input-materials log or line-item unit_cost.
+    # Discounts are not attributed to one stream — they come off the job.
+    labor_rev_d = labor_rev / 100
+    mat_rev_d   = mat_rev / 100
+    labor_gp    = labor_rev_d - labor_cost
+    mat_gp      = mat_rev_d - mat_cost
+    labor_margin = (labor_gp / labor_rev_d * 100) if labor_rev_d > 0 else None
+    mat_margin   = (mat_gp / mat_rev_d * 100) if mat_rev_d > 0 else None
+    # effective charge-out per tech-hour actually spent
+    eff_rate = (labor_rev_d / costed_hours) if costed_hours > 0 else None
+
     # ── Flags ─────────────────────────────────────────────────────────────────
     is_warranty  = "JOB-WARRANTY" in tags_upper
     has_addons   = len(addons) > 0
-    has_discount = inv_discount > 0
+    has_discount = discount_total > 0
     hour_variance = sched_hours - quoted_hrs  # + = over, - = under
 
     # ── Format output ─────────────────────────────────────────────────────────
@@ -3618,41 +3695,95 @@ async def hcp_post_job_analysis(job_id: str) -> str:
         f"║    × crew.  HCP exposes no per-tech tracking and no pause data."
     )
 
-    # ── Revenue ───────────────────────────────────────────────────────────────
+    # ── Money in: billed, collected, still owed ───────────────────────────────
     lines += [
-        f"╠══ REVENUE ═══════════════════════════════════════════════════",
-        f"║  Base scope labor:      {_dollars(labor_rev - addon_rev)}",
-        f"║  Add-on labor:          {_dollars(addon_rev)}" + ("  ← add-on revenue" if has_addons else ""),
-        f"║  Materials (charged):   {_dollars(mat_rev)}",
-        f"║  Subtotal:              {_dollars(inv_subtotal)}",
+        f"╠══ MONEY IN ══════════════════════════════════════════════════",
+        f"║  Line items:            {_dollars(gross_subtotal)}",
     ]
     if has_discount:
-        lines.append(f"║  Discount applied:      -{_dollars(inv_discount)}")
+        lines.append(f"║  Discount:             -{_dollars(discount_total)}"
+                     + (f"  ({discount_names})" if discount_names else ""))
     lines += [
-        f"║  Final invoice:         {_dollars(inv_total)}",
-        f"║  Balance outstanding:   {_dollars(inv_balance)}",
-        f"║  Payment:               {pay_method}  |  Paid: {pay_date or '—'}"
-        + (f"  ({days_to_pay} day(s) after completion)" if days_to_pay else ""),
+        f"║  Contract value:        {_dollars(contract_value)}",
+        f"║  ─────────────────────────────────────────────────────────",
+        f"║  Invoiced to date:      {_dollars(invoiced)}"
+        f"  (across {len(invoices)} invoice(s))",
     ]
+    if unbilled > 0:
+        lines.append(f"║  NOT YET INVOICED:      {_dollars(unbilled)}"
+                     f"  ← work delivered but never billed")
+    lines += [
+        f"║  Collected to date:     {_dollars(collected)}"
+        + (f"  ({len(ok_payments)} payment(s))" if ok_payments else ""),
+        f"║  Still owed:            {_dollars(outstanding)}",
+    ]
+    if invoiced_unpaid and invoiced_unpaid != outstanding:
+        lines.append(f"║    of which invoiced:   {_dollars(invoiced_unpaid)}"
+                     f"  (the rest is uninvoiced)")
+    if surcharges:
+        lines.append(f"║  Card surcharges paid:  {_dollars(surcharges)}"
+                     f"  (deducted from what you keep)")
+    if collected + outstanding != contract_value and contract_value:
+        lines.append(
+            f"║  ⚠ collected + still owed ≠ contract value — a payment may not"
+        )
+        lines.append(
+            f"║    have settled yet. Check this job in Housecall Pro."
+        )
+    lines.append(
+        f"║  Payment:               {pay_methods}  |  last {last_pay_date or '—'}"
+        + (f"  ({days_to_pay} day(s) after completion)" if days_to_pay else "")
+    )
+    if len(invoices) > 1:
+        lines.append(f"║")
+        lines.append(f"║  Invoice breakdown:")
+        for i in sorted(invoices, key=lambda x: str(x.get("invoice_number"))):
+            ipaid = sum(int(p.get("amount") or 0) for p in (i.get("payments") or [])
+                        if isinstance(p, dict) and p.get("status") == "succeeded")
+            lines.append(
+                f"║    #{str(i.get('invoice_number','?')):<6} {i.get('status','?'):<10}"
+                f" billed {_dollars(i.get('amount')):>10}"
+                f"  paid {_dollars(ipaid):>10}"
+                f"  due {_dollars(i.get('due_amount')):>10}"
+            )
 
-    # Add-on detail
+    # ── Labor vs materials, both sides ────────────────────────────────────────
+    lines += [
+        f"╠══ LABOR vs MATERIALS ════════════════════════════════════════",
+        f"║  {'':<12}{'charged':>12}{'cost':>12}{'profit':>12}{'margin':>9}",
+        f"║  {'Labor':<12}{_dollars(labor_rev):>12}{'$' + format(labor_cost, ',.2f'):>12}"
+        f"{'$' + format(labor_gp, ',.2f'):>12}"
+        + (f"{labor_margin:>8.0f}%" if labor_margin is not None else f"{'—':>9}"),
+        f"║  {'Materials':<12}{_dollars(mat_rev):>12}{'$' + format(mat_cost, ',.2f'):>12}"
+        f"{'$' + format(mat_gp, ',.2f'):>12}"
+        + (f"{mat_margin:>8.0f}%" if mat_margin is not None else f"{'—':>9}"),
+    ]
+    if has_discount:
+        lines.append(f"║  {'Discount':<12}{'-' + _dollars(discount_total):>12}"
+                     f"{'—':>12}{'-' + _dollars(discount_total):>12}{'—':>9}")
+    lines += [
+        f"║  ─────────────────────────────────────────────────────────",
+        f"║  {'TOTAL':<12}{_dollars(contract_value):>12}"
+        f"{'$' + format(total_cost, ',.2f'):>12}"
+        f"{'$' + format(gross_profit, ',.2f'):>12}{margin_pct:>8.0f}%",
+        f"║",
+        f"║  Labor cost basis:      {costed_hours:.1f} tech-hrs × ${cost_rate:.0f}/hr"
+        f"  ({costed_basis})",
+        f"║  Materials cost basis:  "
+        + ("input materials log" if input_mats else "line item unit costs"),
+    ]
+    if eff_rate is not None:
+        lines.append(
+            f"║  Effective labor rate:  ${eff_rate:,.0f}/tech-hour charged"
+            f"  (vs ${cost_rate:.0f} cost)"
+        )
     if has_addons:
         lines.append(f"║")
-        lines.append(f"║  ADD-ONS ({len(addons)}):")
+        lines.append(f"║  Add-ons ({len(addons)}) — {_dollars(addon_rev)} of the labor above:")
         for a in addons:
-            lines.append(f"║    • {a.get('name','')}  {float(a.get('quantity',0)):.0f} hrs  {_dollars(a.get('amount'))}")
-
-    # ── Cost & margin ─────────────────────────────────────────────────────────
-    lines += [
-        f"╠══ COST & MARGIN ═════════════════════════════════════════════",
-        f"║  Labor cost:            ${labor_cost:,.2f}"
-        f"  ({costed_hours:.1f} tech-hrs × ${cost_rate:.0f}/hr, from {costed_basis})",
-        f"║  Materials cost:        ${mat_cost:,.2f}" + ("  (from input materials log)" if input_mats else "  (from line item unit costs)"),
-        f"║  Total cost:            ${total_cost:,.2f}",
-        f"║  ─────────────────────────────────────────────────────────",
-        f"║  Gross profit:          ${gross_profit:,.2f}",
-        f"║  Gross margin:          {margin_pct:.1f}%",
-    ]
+            lines.append(f"║    • {a.get('name','')}"
+                         f"  {float(a.get('quantity') or 0):.1f} hrs"
+                         f"  {_dollars(a.get('amount'))}")
     if margin_pct < 20:
         lines.append(f"║  ⚠ LOW MARGIN — below 20%")
     elif margin_pct >= 50:
@@ -3819,9 +3950,20 @@ async def hcp_time_variance(
     for r in rows:
         by_grade.setdefault(r["grade"], []).append(r)
 
-    measured  = by_grade.get("measured", [])
-    estimated = by_grade.get("estimated", [])
-    no_signal = by_grade.get("scheduled", []) + by_grade.get("unmeasurable", [])
+    # A "measured" grade means the TIMESTAMPS are trustworthy — not that the
+    # whole quoted scope was worked. When quoted hours far exceed the booked
+    # calendar the job carries scope that never reached an appointment, so its
+    # actual cannot be compared with its quote. Job #478 (54.3 quoted, 3.2
+    # actual, the rest of the scope not yet worked) moved measured-only quote
+    # accuracy from 106% to 95% on its own. Hold those out of the headline.
+    def _scope_incomplete(r: dict) -> bool:
+        return any("incomplete" in f for f in r.get("flags", []))
+
+    measured   = [r for r in by_grade.get("measured", []) if not _scope_incomplete(r)]
+    part_scope = [r for r in by_grade.get("measured", []) if _scope_incomplete(r)]
+    estimated  = [r for r in by_grade.get("estimated", []) if not _scope_incomplete(r)]
+    part_scope += [r for r in by_grade.get("estimated", []) if _scope_incomplete(r)]
+    no_signal  = by_grade.get("scheduled", []) + by_grade.get("unmeasurable", [])
 
     lines = [
         f"╔══ TIME VARIANCE — {start_date} to {end_date} ══════════════════",
@@ -3912,6 +4054,26 @@ async def hcp_time_variance(
             )
             lines.append(
                 f"║    Use the MEASURED-ONLY block above to judge quote accuracy."
+            )
+
+    if part_scope:
+        lines.append(
+            f"╠══ SCOPE NOT FULLY WORKED ({len(part_scope)}) ═══════════════════════"
+        )
+        lines.append(
+            f"║  Quoted hours far exceed the booked calendar, so part of the scope"
+        )
+        lines.append(
+            f"║  never reached an appointment. Held out of the totals — comparing"
+        )
+        lines.append(
+            f"║  their actual to their quote would measure work that never happened."
+        )
+        for r in sorted(part_scope, key=lambda r: -r["quoted"]):
+            lines.append(
+                f"║  #{str(r['num']):<6}{r['name'][:18]:<19}"
+                f"quoted {r['quoted']:>6.1f}  booked {r['scheduled'] or 0:>6.1f}"
+                f"  actual {r['actual'] or 0:>6.1f}"
             )
 
     _totals("TOTALS — MEASURED ONLY", measured)
@@ -4464,6 +4626,209 @@ async def hcp_get_estimate_attachments(estimate_id: str) -> str:
             lines.append(f"    {url}")
         lines.append("")
     lines.append("Links expire — re-run this tool if one stops working.")
+    return "\n".join(lines)
+
+
+# ── Money and time across a date range ─────────────────────────────────────────
+
+def _fin_row(label: str, charged: float, cost: float) -> str:
+    """One right-aligned row of the labor/materials money table."""
+    profit = charged - cost
+    margin = f"{profit / charged * 100:>7.0f}%" if charged else f"{'—':>8}"
+    return (f"║  {label:<11}"
+            f"{'$' + format(charged, ',.0f'):>13}"
+            f"{'$' + format(cost, ',.0f'):>13}"
+            f"{'$' + format(profit, ',.0f'):>13}"
+            f"{margin}")
+
+
+@mcp.tool()
+async def hcp_job_financials(
+    start_date: str,
+    end_date: str,
+    max_jobs: Optional[int] = 100,
+    only_completed: Optional[bool] = True,
+    sort_by: Optional[str] = "margin",
+) -> str:
+    """
+    Money and time together for every job in a date range.
+
+    The money side, from ALL invoices on each job:
+      • Contract value — what the job is worth
+      • Invoiced / Collected / Still owed
+      • Not yet invoiced — delivered work that was never billed, which is a
+        different problem from an unpaid balance and is easy to miss
+
+    The time side, all three measures:
+      • Quoted (labor line items) / Scheduled (appointments × crew) / Actual
+        (per-day model, graded — see hcp_time_variance for what the grades mean)
+
+    Labor and materials are split on both revenue and cost, so you can see
+    which side of the work is actually making money.
+
+    Args:
+        start_date: First day, YYYY-MM-DD
+        end_date: Last day, YYYY-MM-DD
+        max_jobs: Cap on jobs analyzed (default 100)
+        only_completed: Skip jobs that never completed (default True)
+        sort_by: margin | profit | revenue | owed | unbilled
+    """
+    cfg       = _load_config()
+    tm        = _time_model(cfg)
+    cost_rate = float(cfg.get("scheduling", {}).get("blended_cost_per_tech_hour", 95.0))
+    limit     = _as_int(max_jobs, 100)
+
+    jobs: list[dict] = []
+    page, total_in_range = 1, None
+    while len(jobs) < limit:
+        data = await api_request("GET", "/jobs", params={
+            "scheduled_start_min": f"{start_date}T00:00:00Z",
+            "scheduled_start_max": f"{end_date}T23:59:59Z",
+            "page": page, "page_size": 100,
+            "sort_by": "created_at", "sort_direction": "desc",
+        })
+        batch = data.get("jobs", [])
+        if total_in_range is None:
+            total_in_range = data.get("total_items")
+        jobs += batch
+        pages = data.get("total_pages") or 1
+        if page >= pages or not batch:
+            break
+        page += 1
+
+    if only_completed:
+        jobs = [j for j in jobs
+                if _norm_status(j.get("work_status", "")).startswith("complete")]
+    truncated = len(jobs) > limit
+    jobs = jobs[:limit]
+    if not jobs:
+        return (f"No {'completed ' if only_completed else ''}jobs between "
+                f"{start_date} and {end_date}.")
+
+    async with _hcp_client() as client:
+        fetched = await _fanout_jobs(
+            client, jobs, ["/line_items", "/appointments", "/invoices"])
+
+    rows, failed = [], []
+    for job, ((li, li_e), (ap, ap_e), (iv, iv_e)) in zip(jobs, fetched):
+        if ap_e == "HTTP 400":       # archived job — no appointments, still fine
+            ap, ap_e = {}, None
+        if li_e or iv_e:
+            failed.append((str(job.get("invoice_number", "?")), li_e or iv_e))
+            continue
+        items = (li or {}).get("data") or []
+        appts = (ap or {}).get("appointments") or []
+        if not isinstance(appts, list):
+            appts = []
+
+        est = _estimate_job_time(job, appts, items, tm)
+        money = _job_money(job, iv)
+
+        labor_rev = sum(int(i.get("amount") or 0)
+                        for i in items if i.get("kind") == "labor") / 100
+        mat_rev   = sum(int(i.get("amount") or 0)
+                        for i in items if i.get("kind") == "materials") / 100
+        mat_cost  = sum(int(i.get("unit_cost") or 0) * float(i.get("quantity") or 1)
+                        for i in items if i.get("kind") == "materials") / 100
+        hours = (est["actual"] if est["grade"] in ("measured", "estimated")
+                 else (est["scheduled"] or 0)) or 0.0
+        labor_cost = hours * cost_rate
+        revenue = money["contract"] / 100
+        profit  = revenue - labor_cost - mat_cost
+        cust = job.get("customer") or {}
+        rows.append({
+            "num": job.get("invoice_number", "?"),
+            "name": f"{cust.get('first_name','')} {cust.get('last_name','')}".strip(),
+            "revenue": revenue, "profit": profit,
+            "margin": (profit / revenue * 100) if revenue else 0.0,
+            "labor_rev": labor_rev, "mat_rev": mat_rev,
+            "labor_cost": labor_cost, "mat_cost": mat_cost,
+            "collected": money["collected"] / 100,
+            "owed": money["outstanding"] / 100,
+            "unbilled": money["unbilled"] / 100,
+            "surcharge": money["surcharges"] / 100,
+            "quoted": est["quoted"], "scheduled": est["scheduled"] or 0.0,
+            "actual": est["actual"], "grade": est["grade"], "hours": hours,
+            "part_scope": any("incomplete" in f for f in est["flags"]),
+            "reconciles": money["reconciles"],
+        })
+
+    keymap = {"margin": lambda r: r["margin"], "profit": lambda r: r["profit"],
+              "revenue": lambda r: r["revenue"], "owed": lambda r: r["owed"],
+              "unbilled": lambda r: r["unbilled"]}
+    rows.sort(key=keymap.get(sort_by, keymap["margin"]))
+
+    T = lambda k: sum(r[k] for r in rows)
+    lines = [
+        f"╔══ JOB FINANCIALS — {start_date} to {end_date} ════════════════",
+        f"║  {len(rows)} job(s)"
+        + (f"  |  ⚠ capped at {limit} of {total_in_range}" if truncated else ""),
+    ]
+    if failed:
+        lines.append(f"║  ⚠ {len(failed)} excluded, data fetch failed: "
+                     + ", ".join(f"#{n}" for n, _ in failed[:8]))
+
+    lines += [
+        f"╠══ MONEY ═════════════════════════════════════════════════════",
+        f"║  Contract value:    ${T('revenue'):>12,.0f}",
+        f"║  Collected:         ${T('collected'):>12,.0f}",
+        f"║  Still owed:        ${T('owed'):>12,.0f}",
+    ]
+    if T("unbilled") > 0:
+        lines.append(f"║  NOT YET INVOICED:  ${T('unbilled'):>12,.0f}"
+                     f"   ← delivered but never billed")
+    if T("surcharge") > 0:
+        lines.append(f"║  Card surcharges:   ${T('surcharge'):>12,.0f}")
+    lines += [
+        f"║",
+        f"║  {'':<11}{'charged':>13}{'cost':>13}{'profit':>13}{'margin':>8}",
+        _fin_row("Labor", T("labor_rev"), T("labor_cost")),
+        _fin_row("Materials", T("mat_rev"), T("mat_cost")),
+        f"║  ─────────────────────────────────────────────────────────",
+        _fin_row("TOTAL", T("revenue"), T("labor_cost") + T("mat_cost")),
+    ]
+
+    # see the note in hcp_time_variance: a measured grade vouches for the
+    # timestamps, not for the whole quoted scope having been worked
+    measured = [r for r in rows if r["grade"] == "measured" and not r["part_scope"]]
+    part_scope = [r for r in rows if r["part_scope"]]
+    lines += [
+        f"╠══ TIME (tech-hours) ═════════════════════════════════════════",
+        f"║  Quoted:     {T('quoted'):>9,.1f}",
+        f"║  Scheduled:  {T('scheduled'):>9,.1f}",
+        f"║  Actual:     {sum(r['actual'] or 0 for r in rows):>9,.1f}"
+        f"   ({len(measured)} of {len(rows)} jobs fully measured)",
+    ]
+    if measured:
+        mq = sum(r["quoted"] for r in measured)
+        ma = sum(r["actual"] or 0 for r in measured)
+        if mq:
+            lines.append(f"║  Measured-only quote accuracy: {ma/mq*100:.0f}%"
+                         f"  ({mq:,.1f} quoted vs {ma:,.1f} actual)")
+    if part_scope:
+        lines.append(f"║  {len(part_scope)} job(s) held out — quoted scope was never fully")
+        lines.append(f"║    booked, so actual cannot be compared to quote: "
+                     + ", ".join(f"#{r['num']}" for r in part_scope[:6]))
+
+    lines += [
+        f"╠══ BY JOB (worst margin first) ═══════════════════════════════",
+        f"║  {'Job':<7}{'Customer':<17}{'Revenue':>9}{'Profit':>9}{'Marg':>6}"
+        f"{'Owed':>9}{'Hrs':>7}  grade",
+    ]
+    for r in rows:
+        flag = "" if r["reconciles"] else " ⚠"
+        lines.append(
+            f"║  #{str(r['num']):<6}{r['name'][:16]:<17}"
+            f"{r['revenue']:>9,.0f}{r['profit']:>9,.0f}{r['margin']:>5.0f}%"
+            f"{r['owed']:>9,.0f}{r['hours']:>7.1f}  {r['grade']}{flag}"
+        )
+    lines += [
+        f"╠══════════════════════════════════════════════════════════════",
+        f"║  ℹ Labor cost = hours × ${cost_rate:.0f}. Hours are actual where the day",
+        f"║    model measured them, otherwise scheduled — check the grade column.",
+        f"║    ⚠ on a row means collected + owed ≠ contract value.",
+        f"╚{'═'*61}",
+    ]
     return "\n".join(lines)
 
 

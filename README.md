@@ -414,6 +414,14 @@ What's in the backlog that should get scheduled first?
 Where are we overbooked in the next four weeks?
 ```
 
+**Money**
+```
+Run job financials for last month.
+Which jobs have work we delivered but never invoiced?
+How much is still owed across July?
+Are we making more on labor or on materials?
+```
+
 **Reviewing the week**
 ```
 Run a time variance for last week.
@@ -570,7 +578,7 @@ Added or lost a tech? Re-run the setup wizard, then `hcp_check_setup`.
 
 Everything below is optional.
 
-**Architecture.** One server, `housecallpro_LHSTL.py`, with 55 tools returning
+**Architecture.** One server, `housecallpro_LHSTL.py`, with 56 tools returning
 formatted, readable output. There is nothing else to register.
 
 Earlier versions shipped 20 additional per-domain servers returning raw JSON.
