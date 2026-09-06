@@ -4803,6 +4803,12 @@ _EQUIPMENT_WORDS = ("fan", "heater", "dehumidifier", "blower", "air mover",
                     "space heater")
 
 _TOOL_CLASSES = {"PORTABLE POWER", "WET DRY VACS"}
+# Hand tools are bought once and kept, the same as equipment, so the dollar
+# threshold does not apply to them: a $17 rafter square is shop stock for the
+# same reason a $220 rotary hammer is. Until this existed the store's own class
+# went unread and a 46-in wrecking bar and a square posted onto jobs as
+# materials without ever reaching the review pile.
+_KEEP_TOOL_CLASSES = {"CONSTRUCTION HAND TOOLS", "HAND TOOLS"}
 _TOOL_WORDS = ("combo kit", "starter kit", "rotary hammer", "impact driver",
                "circular saw", "miter saw", "table saw", "nail gun", "nailer",
                "compressor", "vacuum", "generator", "ladder", "drill/driver")
@@ -4994,6 +5000,41 @@ def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
                 last[col] = val
             elif last.get(col):
                 r[col] = last[col]
+
+    # ── credits that point back at an order ──────────────────────────────────
+    # A return usually carries no PO of its own. Lowe's writes the credit as its
+    # own POS transaction with an "Order Reference" back to the order being
+    # returned, and leaves the PO column N/A. Without that link the credit never
+    # nets against its purchase, and the damage lands twice: the job keeps the
+    # full cost of material it sent back, AND the credit is booked a second time
+    # as positive overhead spend, because the ledger records absolute amounts.
+    # So inherit the job from the referenced order before anything is classified.
+    ref_cols = ("Order Reference", "Original Order Number", "Reference Order",
+                "Original Invoice Number")
+    job_cols = ("PO Number", "Job Name", "Job", "Job Number", "Job/PO")
+    order_job: dict[str, str] = {}
+    for r in rows:
+        num = next((str(r.get(c) or "").strip() for c in group_cols
+                    if str(r.get(c) or "").strip()), "")
+        job = _pick(r, "job")
+        if num and job and job.upper() not in _NON_JOB_LABELS:
+            order_job.setdefault(num, job)
+    for r in rows:
+        if _pick(r, "job").upper() not in _NON_JOB_LABELS:
+            continue
+        ref = ""
+        for c in ref_cols:
+            v = str(r.get(c) or "").strip()
+            if v and v.upper() not in _NON_JOB_LABELS:
+                ref = v
+                break
+        inherited = order_job.get(ref)
+        if not inherited:
+            continue
+        for c in job_cols:
+            if c in r:
+                r[c] = inherited
+                break
     return rows, vendor
 
 
@@ -5018,8 +5059,11 @@ def _classify(row: dict, tool_threshold: float,
     if amount == 0:
         return "skip", "$0 line (bundle component or fee)"
 
-    looks_tool = (klass in _TOOL_CLASSES or _word_hit(low, _TOOL_WORDS))
+    looks_tool = (klass in _TOOL_CLASSES or klass in _KEEP_TOOL_CLASSES
+                  or _word_hit(low, _TOOL_WORDS))
     if looks_tool and not _word_hit(low, _CONSUMABLE_WORDS):
+        if klass in _KEEP_TOOL_CLASSES:
+            return "general", f"hand tool — shop stock at any price (${amount:,.2f})"
         if amount >= tool_threshold:
             return "general", f"tool purchase ${amount:,.2f} — overhead, not one job"
         return "review", f"small tool ${amount:,.2f} — job cost or shop stock?"
@@ -5050,6 +5094,55 @@ def _classify(row: dict, tool_threshold: float,
             return "general", "consumable, treated as van stock this run"
         return "review", "job material or van stock? same item can be either"
     return "job", ""
+
+def _job_window(job: dict) -> tuple[str, str]:
+    """A job's scheduled span as (YYYY-MM-DD, YYYY-MM-DD); ('', '') if unscheduled."""
+    start, end, _ = _sched(job.get("schedule"))
+    s = str(start or "")[:10]
+    e = str(end or "")[:10]
+    return s, (e or s)
+
+
+def _pick_segment(segs: list[dict], purchase_date: str) -> Optional[dict]:
+    """Which segment of a split job does a purchase belong to?
+
+    Housecall Pro splits a job into SEGMENTS — 400-1, 400-2, 400-3 — and each one
+    carries its own schedule and its own materials allowance. The receipt never
+    knows that: the tech writes the base number on the PO at the register. So the
+    purchase DATE is the only honest signal for which segment the money is part
+    of, and it is read in this order:
+
+      • bought inside a segment's scheduled window  →  that segment
+      • else the segment starting soonest AFTER it  →  material is bought ahead
+        of the work, so a purchase before any segment belongs to the next one up
+      • else the last segment that finished before it  →  a late buy against work
+        already buttoned up
+
+    Overlapping windows, an undated purchase, or segments with no schedule at all
+    return None. The caller then leaves the line on the bare base number, so it
+    surfaces as unresolved and posts nowhere — an unmatched purchase is a
+    question to answer, not a coin to flip, because materials cannot be deleted
+    off a job once posted.
+    """
+    dated = [(s, _job_window(s)) for s in segs]
+    dated = [(s, w) for s, w in dated if w[0]]
+    if not purchase_date or not dated:
+        return None
+    inside = [s for s, (a, b) in dated if a <= purchase_date <= b]
+    if inside:
+        return inside[0] if len(inside) == 1 else None
+    # index is carried through the sort purely as a tie-breaker, so two segments
+    # sharing a date never fall through to comparing the dicts themselves
+    after = sorted(((w[0], i, s) for i, (s, w) in enumerate(dated)
+                    if w[0] >= purchase_date), key=lambda t: t[:2])
+    if after:
+        return after[0][2]
+    before = sorted(((w[1], i, s) for i, (s, w) in enumerate(dated)
+                     if w[1] <= purchase_date), key=lambda t: t[:2])
+    if before:
+        return before[-1][2]
+    return None
+
 
 def _already_imported(m: dict, seen: set) -> bool:
     """Has this item from this receipt already been posted to this job?
@@ -5108,7 +5201,18 @@ async def hcp_import_job_costs(
     exceptions in config.json under job_cost_import.
 
     Returns are netted against purchases of the same item on the same job, so a
-    buy-and-return pair cancels instead of inflating the job.
+    buy-and-return pair cancels instead of inflating the job. A credit that
+    carries no job of its own inherits one from the order it references, which is
+    how most suppliers write a return.
+
+    SPLIT JOBS: Housecall Pro divides work into segments — 400-1, 400-2, 400-3 —
+    each with its own schedule and its own materials allowance, but the tech
+    writes only the base number on the PO. A receipt saying "400" is matched to
+    the segment whose scheduled window the purchase date falls in, or failing
+    that to the segment starting soonest after it, since material is bought ahead
+    of the work. If the date cannot pick one segment cleanly the line posts
+    nowhere and is listed for you, rather than being guessed onto a job it can
+    never be removed from.
 
     Re-running is safe: each posted line records the receipt it came from, and
     lines already present on a job are skipped rather than duplicated.
@@ -5154,29 +5258,115 @@ async def hcp_import_job_costs(
         bucket, why = _classify(r, threshold, route, always_job, always_gen)
         buckets[bucket].append({"row": r, "why": why, "bucket": bucket})
 
+    # ── resolve the receipt's job numbers to HCP jobs ────────────────────────
+    # This runs BEFORE netting, because one receipt job number can resolve to
+    # more than one job. HCP splits work into SEGMENTS — 400-1, 400-2, 400-3 —
+    # each with its own schedule and its own materials allowance, but the tech
+    # writes only the base number on the PO. So "400" on a receipt is a question,
+    # and the purchase date answers it.
+    wanted_bases = {w.split("-")[0] for w in wanted}
+    receipt_nums = set()
+    for e in buckets["job"]:
+        n = _pick(e["row"], "job").upper()
+        if not n or (wanted and n not in wanted and n not in wanted_bases):
+            continue
+        receipt_nums.add(n)
+    bases = {n.split("-")[0] for n in receipt_nums}
+
+    lookup: dict[str, dict] = {}
+    segments: dict[str, list[dict]] = {}
+    page = 1
+    # Paged to the end rather than stopping once each number is seen: segments of
+    # one job are created at different times and land on different pages, so an
+    # early exit would find 400-3 and silently miss 400-1 and 400-2.
+    while page <= 12:
+        data = await api_request("GET", "/jobs", params={
+            "page": page, "page_size": 100,
+            "sort_by": "created_at", "sort_direction": "desc"})
+        for j in data.get("jobs", []):
+            num = str(j.get("invoice_number") or "").strip().upper()
+            if not num:
+                continue
+            if num in receipt_nums:
+                lookup.setdefault(num, j)
+            base = num.split("-")[0]
+            # Collect every segment under a base number the receipt mentions.
+            # Whether the base ALSO exists as a job of its own is decided later,
+            # in _resolve, which prefers an exact match and only falls back to
+            # segments when there is no job with that bare number.
+            if "-" in num and base in bases:
+                segments.setdefault(base, []).append(j)
+        if page >= (data.get("total_pages") or 1):
+            break
+        page += 1
+
+    def _resolve(job_no: str, pdate: str) -> str:
+        """Base number -> the segment this purchase belongs to, or unchanged."""
+        if job_no in lookup or job_no not in segments:
+            return job_no
+        seg = _pick_segment(segments[job_no], pdate)
+        if not seg:
+            return job_no
+        num = str(seg.get("invoice_number") or "").strip().upper()
+        if not num:
+            return job_no
+        lookup.setdefault(num, seg)
+        return num
+
     # ── net returns against purchases, per job + item ────────────────────────
-    merged: dict[tuple, dict] = {}
+    # Two passes over the job lines, because a credit has to land on the SAME
+    # segment as the purchase it cancels. Purchases resolve on their own date;
+    # a credit then follows its purchase whenever that item resolved to exactly
+    # one segment, and only falls back to its own date when it did not. Netting
+    # a return against a different segment of the same job would leave one
+    # segment carrying material it never used and credit another that did.
+    rows_job = []
     for entry in buckets["job"]:
         r = entry["row"]
         job_no = _pick(r, "job").upper()
-        if wanted and job_no not in wanted:
+        if wanted and job_no not in wanted and job_no not in wanted_bases:
+            continue
+        rows_job.append((r, job_no, _norm_date(_pick(r, "date")),
+                         _money(_pick(r, "amount")),
+                         _pick(r, "sku") or _pick(r, "desc").lower()))
+
+    seg_of_item: dict[tuple, set] = {}
+    resolved: dict[int, str] = {}
+    for i, (r, job_no, pdate, amount, item) in enumerate(rows_job):
+        if amount < 0:
+            continue
+        num = _resolve(job_no, pdate)
+        resolved[i] = num
+        if num != job_no:
+            seg_of_item.setdefault((job_no, item), set()).add(num)
+    for i, (r, job_no, pdate, amount, item) in enumerate(rows_job):
+        if amount >= 0:
+            continue
+        seen = seg_of_item.get((job_no, item)) or set()
+        resolved[i] = (next(iter(seen)) if len(seen) == 1
+                       else _resolve(job_no, pdate))
+
+    merged: dict[tuple, dict] = {}
+    for i, (r, job_no, pdate, amount, item) in enumerate(rows_job):
+        num = resolved.get(i, job_no)
+        if wanted and num not in wanted and num.split("-")[0] not in wanted:
             continue
         desc = _pick(r, "desc")
-        key = (job_no, _pick(r, "sku") or desc.lower())
-        amount = _money(_pick(r, "amount"))
+        key = (num, item)
         qty = _money(_pick(r, "qty")) or 1.0
         m = merged.setdefault(key, {
-            "job": job_no, "name": desc[:120], "sku": _pick(r, "sku"),
+            "job": num, "name": desc[:120], "sku": _pick(r, "sku"),
             "amount": 0.0, "qty": 0.0, "dates": set(), "receipts": set(),
             "buyers": set(), "lines": 0, "bought": 0, "returned": 0,
+            "from_base": job_no if num != job_no else "",
         })
         sign = -1 if amount < 0 else 1
         m["amount"] += amount
         m["qty"] += qty * sign
         m["lines"] += 1
         m["returned" if amount < 0 else "bought"] += 1
-        if d := _norm_date(_pick(r, "date")):
-            m["dates"].add(d)
+        if pdate:
+            m["dates"].add(pdate)
         if rc := _pick(r, "receipt"):
             m["receipts"].add(rc)
         if b := _pick(r, "purchaser"):
@@ -5196,20 +5386,6 @@ async def hcp_import_job_costs(
     for m in postable:
         by_job.setdefault(m["job"], []).append(m)
 
-    # ── resolve job numbers to HCP jobs ──────────────────────────────────────
-    lookup: dict[str, dict] = {}
-    page = 1
-    while page <= 6 and len(lookup) < len(by_job):
-        data = await api_request("GET", "/jobs", params={
-            "page": page, "page_size": 100,
-            "sort_by": "created_at", "sort_direction": "desc"})
-        for j in data.get("jobs", []):
-            num = str(j.get("invoice_number") or "")
-            if num in by_job and num not in lookup:
-                lookup[num] = j
-        if page >= (data.get("total_pages") or 1):
-            break
-        page += 1
     unknown = sorted(set(by_job) - set(lookup))
 
     # ── what is already on each job, so a re-run does not duplicate ──────────
@@ -5273,6 +5449,15 @@ async def hcp_import_job_costs(
             head = f"║  #{num} — ⚠ NOT FOUND in Housecall Pro"
         lines.append(f"║")
         lines.append(f"{head}   {D(jtotal)} across {len(items)} item(s)")
+        base = next((m["from_base"] for m in items if m.get("from_base")), "")
+        if base:
+            n_seg = sum(1 for m in items if m.get("from_base"))
+            a, b = _job_window(job) if job else ("", "")
+            lines.append(f"║      ↳ {n_seg} line(s) came in on PO #{base} and were matched"
+                         f" to this segment")
+            if a:
+                lines.append(f"║        by purchase date against its schedule "
+                             f"({a} → {b})")
         if job:
             bill = charged.get(num, 0.0)
             prior = spent_already.get(num, 0.0)
@@ -5373,9 +5558,28 @@ async def hcp_import_job_costs(
             lines.append(f"║      #{m['job']}  {D(abs(m['amount'])):>9}  {m['name'][:44]}")
 
     if unknown:
-        lines.append(f"╠══ UNKNOWN JOB NUMBERS ═══════════════════════════════════════")
-        lines.append(f"║  Not found in Housecall Pro: {', '.join('#' + u for u in unknown)}")
-        lines.append(f"║  Check the job number on the receipt. Nothing posted for these.")
+        plain = [u for u in unknown if u not in segments]
+        lines.append(f"╠══ UNRESOLVED JOB NUMBERS ════════════════════════════════════")
+        if plain:
+            lines.append(f"║  Not found in Housecall Pro: "
+                         + ", ".join("#" + u for u in plain))
+            lines.append(f"║  Check the job number written on the receipt.")
+        for n in (u for u in unknown if u in segments):
+            segs = segments[n]
+            lines.append(f"║")
+            lines.append(f"║  #{n} is split into {len(segs)} segment(s) in Housecall Pro,")
+            lines.append(f"║  and the purchase date did not land in any one of them:")
+            for s in segs:
+                a, b = _job_window(s)
+                lines.append(f"║      #{str(s.get('invoice_number') or ''):<7}"
+                             f"{(a or 'unscheduled'):>12} → {(b or '—'):<12}"
+                             f"{(s.get('description') or '')[:26]}")
+            dts = sorted({d for m in by_job.get(n, []) for d in m["dates"]})
+            if dts:
+                lines.append(f"║      bought {', '.join(dts[:6])}")
+            lines.append(f"║  Put the full segment number on the receipt's PO field, or")
+            lines.append(f"║  edit the PO in the CSV to the segment you mean, then re-run.")
+        lines.append(f"║  Nothing posted for these.")
 
     # ── post ─────────────────────────────────────────────────────────────────
     lines.append(f"╠══════════════════════════════════════════════════════════════")
