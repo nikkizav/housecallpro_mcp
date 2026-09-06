@@ -4658,11 +4658,11 @@ async def hcp_get_estimate_attachments(estimate_id: str) -> str:
 # Both lists are overridable per company in config.json.
 _VAN_STOCK_WORDS = ("glove", "trash bag", "contractor bag", "rag ", "rags",
                     "micro twl", "towel", "broom", "sweep", "pencil",
-                    "permanent marker", "jobsite marker")
-_AMBIGUOUS_WORDS = ("blade", "drill bit", " bit ", "bit set", "sanding",
+                    "permanent marker", "jobsite marker", "caulk gun")
+_AMBIGUOUS_WORDS = ("blade", "drill bit", "bit", "bit set", "sanding",
                     "abrasive", "sandpaper", "disc", "sponge", "tape",
                     "liner", "brush", "roller", "shim", "bucket", "pail",
-                    "caulk gun", "drop cloth", "tarp")
+                    "drop cloth", "tarp")
 
 # Equipment you own and keep using. Not a job cost at ANY price — a $70 floor
 # fan is shop equipment for the same reason a $700 one is, so the tool
@@ -4725,6 +4725,22 @@ _COL_ALIASES = {
     "receipt":    ("Invoice Number", "Order Number", "Transaction ID",
                    "Receipt", "Receipt Number"),
 }
+
+
+def _word_hit(text: str, words) -> bool:
+    """Whole-word match, so 'Brushed Nickel' is not a paint brush.
+
+    Plain substring matching put a Classic Scroll floor register in the review
+    pile because its finish is "Brushed Nickel". Multi-word entries like
+    "drill bit" still work — the boundary is applied at each end of the phrase.
+    """
+    for w in words:
+        w = w.strip()
+        if not w:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", text):
+            return True
+    return False
 
 
 def _money(raw: Any) -> float:
@@ -4843,9 +4859,8 @@ def _classify(row: dict, tool_threshold: float,
     if amount == 0:
         return "skip", "$0 line (bundle component or fee)"
 
-    looks_tool = (klass in _TOOL_CLASSES
-                  or any(w in low for w in _TOOL_WORDS))
-    if looks_tool and not any(w in low for w in _CONSUMABLE_WORDS):
+    looks_tool = (klass in _TOOL_CLASSES or _word_hit(low, _TOOL_WORDS))
+    if looks_tool and not _word_hit(low, _CONSUMABLE_WORDS):
         if amount >= tool_threshold:
             return "general", f"tool purchase ${amount:,.2f} — overhead, not one job"
         return "review", f"small tool ${amount:,.2f} — job cost or shop stock?"
@@ -4860,16 +4875,16 @@ def _classify(row: dict, tool_threshold: float,
         return "general", f"no usable job reference on the receipt ({job[:24]})"
 
     # Company-specific pins beat everything below.
-    if any(w and w in low for w in always_job):
+    if _word_hit(low, always_job):
         return "job", ""
-    if any(w and w in low for w in always_general):
+    if _word_hit(low, always_general):
         return "general", "van stock (your rule)"
 
-    if any(w in low for w in _EQUIPMENT_WORDS):
+    if _word_hit(low, _EQUIPMENT_WORDS):
         return "general", f"equipment you keep — overhead at any price (${amount:,.2f})"
-    if any(w in low for w in _VAN_STOCK_WORDS):
+    if _word_hit(low, _VAN_STOCK_WORDS):
         return "general", "van stock — restocked regardless of job"
-    if any(w in low for w in _AMBIGUOUS_WORDS):
+    if _word_hit(low, _AMBIGUOUS_WORDS):
         if supplies == "job":
             return "job", ""
         if supplies == "general":
@@ -5034,13 +5049,30 @@ async def hcp_import_job_costs(
     unknown = sorted(set(by_job) - set(lookup))
 
     # ── what is already on each job, so a re-run does not duplicate ──────────
+    # Alongside what is already posted, pull what the customer is being CHARGED
+    # for materials. The line items are generic allowances ("List of Materials")
+    # rather than itemised, so they cannot tell us whether a given blade belongs
+    # to this job — but they do give the budget to judge the spend against, and
+    # they show when a job recovers no materials at all.
     existing: dict[str, set] = {}
+    charged: dict[str, float] = {}
+    spent_already: dict[str, float] = {}
     for num, job in lookup.items():
         try:
             d = await api_request("GET", f"/jobs/{job['id']}/job_input_materials")
             mats = d.get("job_input_materials") or d.get("data") or []
         except Exception:
             mats = []
+        spent_already[num] = sum(
+            float(m.get("unit_cost") or 0) * float(m.get("quantity") or 0)
+            for m in mats if isinstance(m, dict)) / 100
+        try:
+            li = await api_request("GET", f"/jobs/{job['id']}/line_items")
+            items_j = li.get("data") or li.get("line_items") or []
+        except Exception:
+            items_j = []
+        charged[num] = sum(int(i.get("amount") or 0) for i in items_j
+                           if i.get("kind") == "materials") / 100
         seen_keys = set()
         for m in mats:
             if not isinstance(m, dict):
@@ -5077,6 +5109,20 @@ async def hcp_import_job_costs(
             head = f"║  #{num} — ⚠ NOT FOUND in Housecall Pro"
         lines.append(f"║")
         lines.append(f"{head}   {D(jtotal)} across {len(items)} item(s)")
+        if job:
+            bill = charged.get(num, 0.0)
+            prior = spent_already.get(num, 0.0)
+            fresh_total = sum(m["amount"] for m in items if m not in
+                              [d for d in items if _already_imported(d, existing.get(num, set()))])
+            after = prior + fresh_total
+            if bill <= 0:
+                lines.append(f"║      ⚠ this job charges NO materials — every dollar here")
+                lines.append(f"║        comes straight off the margin")
+            else:
+                pct = after / bill * 100 if bill else 0
+                flag = "  ⚠ OVER" if after > bill else ""
+                lines.append(f"║      charging {D(bill)} for materials"
+                             f"  |  spend would reach {D(after)} ({pct:.0f}%){flag}")
         if dupes:
             lines.append(f"║      {len(dupes)} already imported from this receipt — skipping")
         for m in fresh[:14]:
@@ -5106,9 +5152,45 @@ async def hcp_import_job_costs(
 
     _section("NOT A JOB COST (overhead)", buckets["general"],
              "Tools and van/shop stock. Book these to overhead, not to a job.")
-    _section("NEEDS YOUR CALL", buckets["review"],
-             "Could be job materials or van restock. Re-run with supplies='job' "
-             "or supplies='general' to route them all, or pin rules in config.")
+    # Group the undecided items by JOB rather than listing them flat. The job's
+    # own materials allowance is the context that makes the call obvious: a job
+    # billing $2,620 of materials and sitting at 9% of it can clearly absorb its
+    # blades; a job billing nothing cannot.
+    if buckets["review"]:
+        rev_by_job: dict[str, list] = {}
+        for e in buckets["review"]:
+            rev_by_job.setdefault(_pick(e["row"], "job").upper() or "—", []).append(e)
+        rev_total = sum(abs(_money(_pick(e["row"], "amount")))
+                        for e in buckets["review"])
+        lines.append(f"╠══ NEEDS YOUR CALL — {D(rev_total)} ═══════════════════════════")
+        lines.append(f"║  Job material or van restock? Shown against what each job bills")
+        lines.append(f"║  for materials, which is usually the deciding context.")
+        lines.append(f"║  Route them all with supplies='job' or supplies='general', or")
+        lines.append(f"║  pin rules in config to stop being asked.")
+        for jnum in sorted(rev_by_job, key=lambda n: -sum(
+                abs(_money(_pick(e["row"], "amount"))) for e in rev_by_job[n])):
+            group = rev_by_job[jnum]
+            gt = sum(abs(_money(_pick(e["row"], "amount"))) for e in group)
+            job = lookup.get(jnum)
+            lines.append(f"║")
+            if job:
+                bill = charged.get(jnum, 0.0)
+                prior = spent_already.get(jnum, 0.0)
+                head = (f"║  #{jnum} — {(job.get('description') or '')[:32]}"
+                        f"   {D(gt)} undecided")
+                lines.append(head)
+                if bill <= 0:
+                    lines.append(f"║      bills NO materials — anything posted here is margin")
+                else:
+                    lines.append(f"║      bills {D(bill)} materials, {D(prior)} spent so far"
+                                 f"  ({prior / bill * 100:.0f}%)")
+            else:
+                lines.append(f"║  #{jnum}   {D(gt)} undecided")
+            for e in sorted(group, key=lambda e: -abs(_money(_pick(e["row"], "amount"))))[:8]:
+                lines.append(f"║      {D(abs(_money(_pick(e['row'], 'amount')))):>9}"
+                             f"  {_pick(e['row'], 'desc')[:46]}")
+            if len(group) > 8:
+                lines.append(f"║      … and {len(group) - 8} more")
     _section("IGNORED", buckets["skip"])
 
     if cancelled:

@@ -211,7 +211,8 @@
       "towel",
       "broom",
       "pencil",
-      "permanent marker"
+      "permanent marker",
+      "caulk gun"
     ],
     "_always_general_note": "Always van stock, whatever the receipt says \u2014 these get restocked and reused. Matched as lowercase substrings of the item description.",
     "always_job_keywords": [],
@@ -238,6 +239,8 @@
       "sawhorse",
       "ladder"
     ],
-    "_equipment_note": "Things you own and keep using. Overhead at ANY price \u2014 the tool threshold does not apply, because a $70 floor fan is shop equipment for the same reason a $700 one is. This is about what the item IS, not what it cost."
+    "_equipment_note": "Things you own and keep using. Overhead at ANY price \u2014 the tool threshold does not apply, because a $70 floor fan is shop equipment for the same reason a $700 one is. This is about what the item IS, not what it cost.",
+    "_matching_note": "All keyword lists match WHOLE WORDS, not substrings. That is deliberate: 'brush' as a substring put a floor register 'in Brushed Nickel' into the review pile. Multi-word entries like 'drill bit' still work.",
+    "_billing_context_note": "The preview shows each job's materials allowance from its line items next to what the import would spend. The allowances are generic ('List of Materials') so they cannot say whether a given blade belongs to a job, but they show whether a job can absorb the spend \u2014 and flag jobs billing NO materials, where every dollar posted comes off the margin."
   }
 }
