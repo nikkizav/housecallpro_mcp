@@ -415,6 +415,13 @@ What's in the backlog that should get scheduled first?
 Where are we overbooked in the next four weeks?
 ```
 
+**Material costs from supplier receipts**
+```
+Import the Home Depot purchase history from my Downloads folder.
+(review the preview, then)
+Post it for real.
+```
+
 **Money**
 ```
 Run job financials for last month.
@@ -646,7 +653,7 @@ Added or lost a tech? Re-run the setup wizard, then `hcp_check_setup`.
 
 Everything below is optional.
 
-**Architecture.** One server, `housecallpro_LHSTL.py`, with 56 tools returning
+**Architecture.** One server, `housecallpro_LHSTL.py`, with 57 tools returning
 formatted, readable output. There is nothing else to register.
 
 Earlier versions shipped 20 additional per-domain servers returning raw JSON.

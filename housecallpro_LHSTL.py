@@ -13,6 +13,8 @@ that file — no code changes required here.
 """
 
 import asyncio
+import csv
+import io
 import json
 import os
 import re
@@ -3595,14 +3597,18 @@ async def hcp_post_job_analysis(job_id: str) -> str:
         "estimated": f"estimated actual ({_est['coverage']*100:.0f}% anchored)",
     }.get(_est["grade"], "scheduled time")
     labor_cost   = costed_hours * cost_rate
-    # Use input material costs if logged, otherwise fall back to line item unit_costs
+    # Use input material costs if logged, otherwise fall back to line item
+    # unit_costs. BOTH are in cents — unit_cost on a job input material is cents
+    # exactly like everywhere else in this API. Treating it as dollars reported
+    # $45.76 of materials as $4,576.00, which only became visible once anything
+    # was actually logged.
     if input_mats:
         mat_cost = sum(
             float(m.get("unit_cost") or 0) * float(m.get("quantity") or 1)
             for m in input_mats
-        )
+        ) / 100
     else:
-        mat_cost = mat_cost_li / 100  # convert cents → dollars
+        mat_cost = mat_cost_li / 100
 
     total_cost   = labor_cost + mat_cost
     gross_profit = (revenue / 100) - total_cost
@@ -3820,7 +3826,7 @@ async def hcp_post_job_analysis(job_id: str) -> str:
         for m in input_mats:
             lines.append(
                 f"║  • {m.get('name','')}  qty: {m.get('quantity','')}  "
-                f"cost: ${float(m.get('unit_cost') or 0):.2f}"
+                f"cost: {_dollars(m.get('unit_cost'))} each"
             )
     else:
         lines.append(f"╠══ INPUT MATERIALS ════════════════════════════════════════")
@@ -4629,6 +4635,405 @@ async def hcp_get_estimate_attachments(estimate_id: str) -> str:
     return "\n".join(lines)
 
 
+# ── Supplier receipt import ────────────────────────────────────────────────────
+#
+# Posting material actuals onto jobs, from a supplier purchase export.
+#
+# One hard constraint shapes all of this: job input materials CANNOT BE DELETED
+# through the API. An empty bulk_update is rejected ("must contain at least 1"),
+# and DELETE on an individual material is not a route. The most you can do to a
+# posted line is update it by uuid to zero. So an import is close to permanent,
+# which is why this previews by default and refuses to post twice.
+#
+# bulk_update APPENDS rather than replaces (verified), so existing materials are
+# safe — but that is also why a second run would double everything, hence the
+# receipt marker written into each description.
+
+_TOOL_CLASSES = {"PORTABLE POWER", "WET DRY VACS"}
+_TOOL_WORDS = ("combo kit", "starter kit", "rotary hammer", "impact driver",
+               "circular saw", "miter saw", "table saw", "nail gun", "nailer",
+               "compressor", "vacuum", "generator", "ladder", "drill/driver")
+# Consumed on site and genuinely part of a job, even though the store files them
+# under a tool-ish class.
+_CONSUMABLE_WORDS = ("blade", "bit", "abrasive", "sanding", "disc", "brush",
+                     "roller", "tape", "glove", "caulk", "sponge", "liner")
+_SKIP_CLASSES = {"CONVENIENCE"}
+_SKIP_SUBCLASSES = {"BEVERAGES", "SNACKS", "CANDY"}
+_SKIP_DEPARTMENTS = {"FEES"}
+_NON_JOB_LABELS = {"", "0", "VAN", "SHOP", "STOCK", "OFFICE", "N/A", "NONE"}
+
+# Column aliases so other suppliers can be added without new code.
+_COL_ALIASES = {
+    "job":        ("Job Name", "Job", "Job Number", "PO Number", "Job/PO"),
+    "date":       ("Date", "Transaction Date", "Purchase Date", "Invoice Date"),
+    "sku":        ("SKU Number", "SKU", "Item Number", "Product Code"),
+    "desc":       ("SKU Description", "Description", "Item Description", "Product"),
+    "qty":        ("Quantity", "Qty", "QTY"),
+    "amount":     ("Extended Retail (before discount)", "Extended Price",
+                   "Net Amount", "Line Total", "Amount", "Extended Retail"),
+    "unit":       ("Net Unit Price", "Unit Price", "Price"),
+    "department": ("Department Name", "Department", "Dept"),
+    "klass":      ("Class Name", "Class", "Category"),
+    "subclass":   ("Subclass Name", "Subclass", "Sub Category"),
+    "purchaser":  ("Purchaser", "Buyer", "Employee", "Cardholder"),
+    "receipt":    ("Invoice Number", "Order Number", "Transaction ID",
+                   "Receipt", "Receipt Number"),
+}
+
+
+def _money(raw: Any) -> float:
+    """'$1,234.56' / '-$6.00' / '' -> float dollars."""
+    s = str(raw or "").strip().replace("$", "").replace(",", "")
+    if not s:
+        return 0.0
+    neg = s.startswith("(") and s.endswith(")")
+    if neg:
+        s = s[1:-1]
+    try:
+        v = float(s)
+    except ValueError:
+        return 0.0
+    return -v if neg else v
+
+
+def _pick(row: dict, key: str) -> str:
+    for name in _COL_ALIASES[key]:
+        if name in row and row[name] not in (None, ""):
+            return str(row[name]).strip()
+    return ""
+
+
+def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
+    """Rows plus a vendor label, skipping any preamble above the real header."""
+    # Supplier exports are frequently Windows-encoded rather than UTF-8 — Home
+    # Depot's are cp1252, where a degree sign in "16-Gauge 20° Nails" decodes to
+    # a replacement character under UTF-8 and lands in the material name.
+    data = Path(path).expanduser().read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    vendor = ""
+    for ln in lines[:12]:
+        low = ln.lower()
+        if low.startswith("company name,"):
+            vendor = ln.split(",", 1)[1].strip()
+        for known in ("home depot", "lowe", "sherwin", "menards", "ferguson"):
+            if known in low and not vendor:
+                vendor = ln.strip()[:40]
+    header_idx = 0
+    for i, ln in enumerate(lines[:40]):
+        cells = [c.strip().strip('"') for c in ln.split(",")]
+        if sum(1 for c in cells if any(c in names for names in _COL_ALIASES.values())) >= 4:
+            header_idx = i
+            break
+    reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
+    rows = [r for r in reader if any((v or "").strip() for v in r.values())]
+    return rows, vendor
+
+
+def _classify(row: dict, tool_threshold: float) -> tuple[str, str]:
+    """(bucket, why) — bucket is 'job', 'general', 'skip' or 'review'."""
+    desc = _pick(row, "desc")
+    low = desc.lower()
+    klass = _pick(row, "klass").upper()
+    sub = _pick(row, "subclass").upper()
+    dept = _pick(row, "department").upper()
+    job = _pick(row, "job").upper()
+    amount = abs(_money(_pick(row, "amount")))
+
+    if dept in _SKIP_DEPARTMENTS:
+        return "skip", f"{dept.title()} line, not a material"
+    if klass in _SKIP_CLASSES or sub in _SKIP_SUBCLASSES:
+        return "skip", "food or drink, not a job cost"
+    if amount == 0:
+        return "skip", "$0 line (bundle component or fee)"
+
+    looks_tool = (klass in _TOOL_CLASSES
+                  or any(w in low for w in _TOOL_WORDS))
+    if looks_tool and not any(w in low for w in _CONSUMABLE_WORDS):
+        if amount >= tool_threshold:
+            return "general", f"tool purchase ${amount:,.2f} — overhead, not one job"
+        return "review", f"small tool ${amount:,.2f} — job cost or shop stock?"
+
+    if job in _NON_JOB_LABELS:
+        label = job or "blank"
+        return "general", f"no job on the receipt (job field = {label})"
+    return "job", ""
+
+def _receipt_marker(vendor: str, m: dict) -> str:
+    """Stable per-line note so a second import can recognise its own work."""
+    dates = ",".join(sorted(m.get("dates") or [])) or "?"
+    receipts = ",".join(sorted(m.get("receipts") or [])) or "?"
+    return f"{vendor} {dates} receipt {receipts}"
+
+
+@mcp.tool()
+async def hcp_import_job_costs(
+    csv_path: str,
+    dry_run: Optional[bool] = True,
+    tool_threshold: Optional[float] = 150.0,
+    only_jobs: Optional[str] = None,
+    vendor_label: Optional[str] = None,
+) -> str:
+    """
+    Post material actuals onto jobs from a supplier purchase export.
+
+    Reads a CSV from Home Depot, Lowe's, Sherwin-Williams or similar, works out
+    which lines are genuine job costs, and posts them to each job's input
+    materials — which is what hcp_post_job_analysis and hcp_job_financials use
+    for the materials side of margin.
+
+    PREVIEWS BY DEFAULT. Nothing is written until you re-run with
+    dry_run=False, and you should read the preview first, because job input
+    materials CANNOT BE DELETED through the API. A wrong line can only be
+    zeroed out, not removed.
+
+    What it does with each line:
+      • JOB      — a real material on a real job. Posted.
+      • GENERAL  — overhead, not one job's cost: tool purchases at or above
+                   tool_threshold, and anything bought to van/shop stock or
+                   with no job on the receipt. Reported, never posted.
+      • SKIPPED  — food and drink, $0 bundle components, delivery fees.
+      • REVIEW   — small tools that could be either. Reported, never posted;
+                   decide and enter those by hand.
+
+    Returns are netted against purchases of the same item on the same job, so a
+    buy-and-return pair cancels instead of inflating the job.
+
+    Re-running is safe: each posted line records the receipt it came from, and
+    lines already present on a job are skipped rather than duplicated.
+
+    Args:
+        csv_path: Path to the supplier CSV export
+        dry_run: True (default) previews only. False actually posts.
+        tool_threshold: Dollar value at or above which a tool counts as
+                        overhead rather than a job cost (default 150)
+        only_jobs: Comma-separated job numbers to limit the import to
+        vendor_label: Override the supplier name recorded on each line
+    """
+    try:
+        rows, detected_vendor = _read_receipt_csv(csv_path)
+    except FileNotFoundError:
+        return f"❌ No file at {csv_path}"
+    except Exception as e:
+        return f"❌ Could not read {csv_path}: {type(e).__name__}: {e}"
+    if not rows:
+        return f"❌ No data rows found in {csv_path}."
+
+    vendor = (vendor_label or detected_vendor or "Supplier").strip()
+    threshold = float(tool_threshold if tool_threshold is not None else 150.0)
+    wanted = {j.strip().upper() for j in (only_jobs or "").split(",") if j.strip()}
+
+    buckets: dict[str, list[dict]] = {"job": [], "general": [], "skip": [], "review": []}
+    for r in rows:
+        bucket, why = _classify(r, threshold)
+        buckets[bucket].append({"row": r, "why": why})
+
+    # ── net returns against purchases, per job + item ────────────────────────
+    merged: dict[tuple, dict] = {}
+    for entry in buckets["job"]:
+        r = entry["row"]
+        job_no = _pick(r, "job").upper()
+        if wanted and job_no not in wanted:
+            continue
+        desc = _pick(r, "desc")
+        key = (job_no, _pick(r, "sku") or desc.lower())
+        amount = _money(_pick(r, "amount"))
+        qty = _money(_pick(r, "qty")) or 1.0
+        m = merged.setdefault(key, {
+            "job": job_no, "name": desc[:120], "sku": _pick(r, "sku"),
+            "amount": 0.0, "qty": 0.0, "dates": set(), "receipts": set(),
+            "buyers": set(), "lines": 0, "bought": 0, "returned": 0,
+        })
+        sign = -1 if amount < 0 else 1
+        m["amount"] += amount
+        m["qty"] += qty * sign
+        m["lines"] += 1
+        m["returned" if amount < 0 else "bought"] += 1
+        if d := _pick(r, "date"):
+            m["dates"].add(d[:10])
+        if rc := _pick(r, "receipt"):
+            m["receipts"].add(rc)
+        if b := _pick(r, "purchaser"):
+            m["buyers"].add(b)
+
+    postable = [m for m in merged.values() if round(m["amount"], 2) > 0]
+    # A return that cancels a purchase in this same file is fine and needs no
+    # action. A return with NO purchase here is a credit against something
+    # bought earlier — dropping it silently would leave the job carrying a cost
+    # it no longer has, so call it out separately.
+    cancelled = [m for m in merged.values()
+                 if round(m["amount"], 2) <= 0 and m["bought"] > 0]
+    orphan_returns = [m for m in merged.values()
+                      if round(m["amount"], 2) <= 0 and m["bought"] == 0]
+
+    by_job: dict[str, list[dict]] = {}
+    for m in postable:
+        by_job.setdefault(m["job"], []).append(m)
+
+    # ── resolve job numbers to HCP jobs ──────────────────────────────────────
+    lookup: dict[str, dict] = {}
+    page = 1
+    while page <= 6 and len(lookup) < len(by_job):
+        data = await api_request("GET", "/jobs", params={
+            "page": page, "page_size": 100,
+            "sort_by": "created_at", "sort_direction": "desc"})
+        for j in data.get("jobs", []):
+            num = str(j.get("invoice_number") or "")
+            if num in by_job and num not in lookup:
+                lookup[num] = j
+        if page >= (data.get("total_pages") or 1):
+            break
+        page += 1
+    unknown = sorted(set(by_job) - set(lookup))
+
+    # ── what is already on each job, so a re-run does not duplicate ──────────
+    existing: dict[str, set] = {}
+    for num, job in lookup.items():
+        try:
+            d = await api_request("GET", f"/jobs/{job['id']}/job_input_materials")
+            mats = d.get("job_input_materials") or d.get("data") or []
+        except Exception:
+            mats = []
+        existing[num] = {
+            (str(m.get("part_number") or "").strip(),
+             str(m.get("description") or "").strip())
+            for m in mats if isinstance(m, dict)
+        }
+
+    D = lambda v: f"${v:,.2f}"
+    lines = [
+        f"╔══ JOB COST IMPORT — {vendor} ════════════════════════════════",
+        f"║  {csv_path.split('/')[-1]}",
+        f"║  {len(rows)} line(s) read"
+        + (f"  |  limited to job(s) {', '.join(sorted(wanted))}" if wanted else ""),
+        f"║  {'PREVIEW ONLY — nothing written' if dry_run else '⚠ POSTING TO JOBS'}",
+    ]
+
+    total_post = 0.0
+    lines.append(f"╠══ WILL POST TO JOBS ═════════════════════════════════════════")
+    if not by_job:
+        lines.append(f"║  (nothing)")
+    for num in sorted(by_job, key=lambda n: (n not in lookup, n)):
+        job = lookup.get(num)
+        items = sorted(by_job[num], key=lambda m: -m["amount"])
+        jtotal = sum(m["amount"] for m in items)
+        dupes = [m for m in items
+                 if (m["sku"], _receipt_marker(vendor, m)) in existing.get(num, set())]
+        fresh = [m for m in items if m not in dupes]
+        if job:
+            head = f"║  #{num} — {(job.get('description') or '')[:38]}"
+        else:
+            head = f"║  #{num} — ⚠ NOT FOUND in Housecall Pro"
+        lines.append(f"║")
+        lines.append(f"{head}   {D(jtotal)} across {len(items)} item(s)")
+        if dupes:
+            lines.append(f"║      {len(dupes)} already imported from this receipt — skipping")
+        for m in fresh[:14]:
+            lines.append(f"║      {D(m['amount']):>10}  {m['qty']:>5.1f} × {m['name'][:46]}")
+        if len(fresh) > 14:
+            lines.append(f"║      … and {len(fresh) - 14} more")
+        if job and fresh:
+            total_post += sum(m["amount"] for m in fresh)
+
+    def _section(title: str, entries: list[dict], note: str = "") -> None:
+        if not entries:
+            return
+        tot = sum(abs(_money(_pick(e["row"], "amount"))) for e in entries)
+        lines.append(f"╠══ {title} — {D(tot)} ═══════════════════════════")
+        if note:
+            lines.append(f"║  {note}")
+        seen: dict[str, list] = {}
+        for e in entries:
+            seen.setdefault(e["why"], []).append(e)
+        for why, group in sorted(seen.items(), key=lambda kv: -len(kv[1])):
+            gt = sum(abs(_money(_pick(e["row"], "amount"))) for e in group)
+            lines.append(f"║  {len(group):>3} line(s)  {D(gt):>10}   {why}")
+            for e in group[:4]:
+                lines.append(f"║        {_pick(e['row'], 'desc')[:56]}")
+            if len(group) > 4:
+                lines.append(f"║        … and {len(group) - 4} more")
+
+    _section("NOT A JOB COST (overhead)", buckets["general"],
+             "Tools and van/shop stock. Book these to overhead, not to a job.")
+    _section("NEEDS YOUR CALL", buckets["review"],
+             "Small tools — job cost or shop stock? Enter by hand if they belong.")
+    _section("IGNORED", buckets["skip"])
+
+    if cancelled:
+        nt = sum(abs(m["amount"]) for m in cancelled)
+        lines.append(f"╠══ BOUGHT AND RETURNED ({len(cancelled)}) ═══════════════════════════")
+        lines.append(f"║  Cancel each other out, {D(nt)} not charged. Nothing to do.")
+        for m in cancelled[:6]:
+            lines.append(f"║      #{m['job']}  {m['name'][:52]}")
+    if orphan_returns:
+        ot = sum(abs(m["amount"]) for m in orphan_returns)
+        lines.append(f"╠══ ⚠ RETURNS WITH NO MATCHING PURCHASE ({len(orphan_returns)}) ═════════")
+        lines.append(f"║  {D(ot)} of credits whose original purchase is not in this file.")
+        lines.append(f"║  If you already posted that purchase, the job is still carrying")
+        lines.append(f"║  the cost — reduce it by hand. Not posted either way.")
+        for m in orphan_returns:
+            lines.append(f"║      #{m['job']}  {D(abs(m['amount'])):>9}  {m['name'][:44]}")
+
+    if unknown:
+        lines.append(f"╠══ UNKNOWN JOB NUMBERS ═══════════════════════════════════════")
+        lines.append(f"║  Not found in Housecall Pro: {', '.join('#' + u for u in unknown)}")
+        lines.append(f"║  Check the job number on the receipt. Nothing posted for these.")
+
+    # ── post ─────────────────────────────────────────────────────────────────
+    lines.append(f"╠══════════════════════════════════════════════════════════════")
+    if dry_run:
+        lines += [
+            f"║  Would post {D(total_post)} to {len([n for n in by_job if n in lookup])} job(s).",
+            f"║",
+            f"║  Read the lists above first. Job materials CANNOT be deleted",
+            f"║  once posted — a mistake can only be zeroed out, not removed.",
+            f"║",
+            f"║  To post for real, run again with dry_run=False.",
+            f"╚{'═' * 61}",
+        ]
+        return "\n".join(lines)
+
+    posted, failed = 0, []
+    for num, job in lookup.items():
+        payload = []
+        for m in by_job.get(num, []):
+            marker = _receipt_marker(vendor, m)
+            if (m["sku"], marker) in existing.get(num, set()):
+                continue
+            qty = round(m["qty"], 2) or 1.0
+            payload.append({
+                "name": m["name"],
+                "description": marker,
+                "part_number": m["sku"],
+                "quantity": qty,
+                "unit_cost": int(round(m["amount"] / qty * 100)) if qty else 0,
+            })
+        if not payload:
+            continue
+        try:
+            await api_request(
+                "PUT", f"/jobs/{job['id']}/job_input_materials/bulk_update",
+                json={"job_input_materials": payload})
+            posted += len(payload)
+        except Exception as e:
+            failed.append((num, f"{type(e).__name__}"))
+
+    lines.append(f"║  ✓ Posted {posted} material line(s), {D(total_post)} total.")
+    if failed:
+        lines.append(f"║  ✗ Failed on {len(failed)} job(s): "
+                     + ", ".join(f"#{n} ({e})" for n, e in failed))
+    lines.append(f"║  Check with hcp_post_job_analysis on any of these jobs.")
+    lines.append(f"╚{'═' * 61}")
+    return "\n".join(lines)
+
+
 # ── Money and time across a date range ─────────────────────────────────────────
 
 def _fin_row(label: str, charged: float, cost: float) -> str:
@@ -4707,10 +5112,11 @@ async def hcp_job_financials(
 
     async with _hcp_client() as client:
         fetched = await _fanout_jobs(
-            client, jobs, ["/line_items", "/appointments", "/invoices"])
+            client, jobs,
+            ["/line_items", "/appointments", "/invoices", "/job_input_materials"])
 
     rows, failed = [], []
-    for job, ((li, li_e), (ap, ap_e), (iv, iv_e)) in zip(jobs, fetched):
+    for job, ((li, li_e), (ap, ap_e), (iv, iv_e), (im, im_e)) in zip(jobs, fetched):
         if ap_e == "HTTP 400":       # archived job — no appointments, still fine
             ap, ap_e = {}, None
         if li_e or iv_e:
@@ -4728,8 +5134,16 @@ async def hcp_job_financials(
                         for i in items if i.get("kind") == "labor") / 100
         mat_rev   = sum(int(i.get("amount") or 0)
                         for i in items if i.get("kind") == "materials") / 100
-        mat_cost  = sum(int(i.get("unit_cost") or 0) * float(i.get("quantity") or 1)
-                        for i in items if i.get("kind") == "materials") / 100
+        # Prefer the input-materials log when it exists — that is what a real
+        # supplier receipt import writes, and it is what actually got spent.
+        # Both sources are in cents.
+        logged = (im or {}).get("job_input_materials") or []
+        if logged:
+            mat_cost = sum(float(m.get("unit_cost") or 0) * float(m.get("quantity") or 1)
+                           for m in logged if isinstance(m, dict)) / 100
+        else:
+            mat_cost = sum(int(i.get("unit_cost") or 0) * float(i.get("quantity") or 1)
+                           for i in items if i.get("kind") == "materials") / 100
         hours = (est["actual"] if est["grade"] in ("measured", "estimated")
                  else (est["scheduled"] or 0)) or 0.0
         labor_cost = hours * cost_rate
