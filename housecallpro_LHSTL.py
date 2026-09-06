@@ -5055,6 +5055,7 @@ async def hcp_import_job_costs(
     only_jobs: Optional[str] = None,
     vendor_label: Optional[str] = None,
     supplies: Optional[str] = "review",
+    overhead_only: Optional[bool] = False,
 ) -> str:
     """
     Post material actuals onto jobs from a supplier purchase export.
@@ -5098,6 +5099,10 @@ async def hcp_import_job_costs(
                         overhead rather than a job cost (default 150)
         only_jobs: Comma-separated job numbers to limit the import to
         vendor_label: Override the supplier name recorded on each line
+        overhead_only: Record the non-job spend but post NOTHING to jobs. Use
+                       this to build overhead history from past receipts whose
+                       jobs are already closed and reconciled — you get the
+                       analysis without touching finished work.
         supplies: What to do with the ambiguous consumables —
                   'review' (default, decide yourself), 'job' (this receipt's
                   consumables were bought for the jobs), or 'general' (they
@@ -5356,9 +5361,18 @@ async def hcp_import_job_costs(
     if dry_run:
         oh = sum(abs(_money(_pick(e["row"], "amount")))
                  for e in buckets["general"] + buckets["skip"])
+        if overhead_only:
+            lines += [
+                f"║  overhead_only: would record {D(oh)} of non-job spend and post",
+                f"║  NOTHING to jobs. The {D(total_post)} of job materials stays put.",
+            ]
+        else:
+            lines += [
+                f"║  Would post {D(total_post)} to "
+                f"{len([n for n in by_job if n in lookup])} job(s),",
+                f"║  and record {D(oh)} of non-job spend in the overhead ledger.",
+            ]
         lines += [
-            f"║  Would post {D(total_post)} to {len([n for n in by_job if n in lookup])} job(s),",
-            f"║  and record {D(oh)} of non-job spend in the overhead ledger.",
             f"║",
             f"║  Read the lists above first. Job materials CANNOT be deleted",
             f"║  once posted — a mistake can only be zeroed out, not removed.",
@@ -5372,6 +5386,15 @@ async def hcp_import_job_costs(
     # posting, so the two halves of the receipt stay together.
     overhead_entries = buckets["general"] + buckets["skip"]
     ledger_written, ledger_path = _append_overhead(vendor, overhead_entries)
+
+    if overhead_only:
+        lines.append(f"║  ✓ Recorded {ledger_written} non-job line(s) in "
+                     f"{ledger_path.name}.")
+        lines.append(f"║  Nothing posted to jobs — overhead_only was set.")
+        lines.append(f"║  {D(total_post)} of job materials was left alone.")
+        lines.append(f"║  Read it with hcp_overhead_report.")
+        lines.append(f"╚{'═' * 61}")
+        return "\n".join(lines)
 
     posted, failed = 0, []
     for num, job in lookup.items():

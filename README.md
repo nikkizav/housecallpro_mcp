@@ -440,6 +440,7 @@ Post it for real.
 
 **Spend that isn't on a job**
 ```
+Import last month's Home Depot file, overhead only — don't touch the jobs.
 Show me the non-job spend for August.
 Group the overhead report by purchaser.
 How much are we spending on tools versus van stock?
