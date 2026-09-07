@@ -4666,12 +4666,18 @@ async def hcp_get_estimate_attachments(estimate_id: str) -> str:
 # software, which already receives these card transactions.
 
 _LEDGER_COLUMNS = ("date", "vendor", "receipt", "category", "reason",
-                   "description", "sku", "quantity", "amount",
+                   "description", "sku", "quantity", "amount", "net_paid",
                    "purchaser", "job_on_receipt")
 
 
-def _overhead_category(bucket: str, why: str) -> str:
-    """Stable bucket name for reporting, from the classifier's reason."""
+def _overhead_category(bucket: str, why: str, explicit: str = "") -> str:
+    """Stable bucket name for reporting, from the classifier's reason.
+
+    `explicit` wins when the classifier already knew the answer — a receipt
+    labelled RAFFLE is charity spend and there is nothing to infer.
+    """
+    if explicit:
+        return explicit
     w = why.lower()
     if "tool purchase" in w:
         return "tools"
@@ -4686,6 +4692,28 @@ def _overhead_category(bucket: str, why: str) -> str:
     if "fee" in w or "$0" in w:
         return "fees and zero-value"
     return "unclassified" if bucket == "general" else bucket
+
+
+# What the crew writes in the job column when the purchase is not for a job.
+# Each label gets its OWN ledger category, because these are different kinds of
+# spend that happen to share a field: van restock is a cost of running trucks,
+# raffle baskets are marketing, and shop stock is neither.
+_LABEL_CATEGORY = {
+    "VAN": "van stock", "VANSTOCK": "van stock", "STOCK": "van stock",
+    "TRUCK": "van stock", "RESTOCK": "van stock",
+    "RAFFLE": "charity/raffle", "CHARITY": "charity/raffle",
+    "DONATION": "charity/raffle", "DONATE": "charity/raffle",
+    "SHOP": "shop", "WAREHOUSE": "shop",
+    "OFFICE": "office",
+    "MARKETING": "marketing", "MKTG": "marketing",
+}
+
+# Deliberately NOT folded into van stock. A "0" can mean "van stock" or it can
+# mean the field got skipped at the register, and there is no way to tell them
+# apart after the fact — so they surface as a short worklist each run instead of
+# being quietly absorbed into a category they may not belong to.
+_UNASSIGNED_LABELS = {"", "0", "00", "000", "N/A", "NA", "NONE", "-", "--",
+                      "NOJOB", "NONJOB"}
 
 
 def _ledger_path() -> Path:
@@ -4713,6 +4741,121 @@ def _ledger_path() -> Path:
     return _HERE / "overhead_ledger.csv"
 
 
+def _rid(raw: Any) -> str:
+    """Normalise a receipt / invoice id so the same receipt keys the same way.
+
+    Home Depot invoice numbers carry leading zeros that survive one export and
+    get stripped by the next (Excel does it silently), so '0623881' and '623881'
+    are the same receipt written two ways. Keying dedup on the raw string let a
+    re-import book the same caulk gun twice. Excel also renders a long Lowe's
+    order number as '3.00902E+17', which is not recoverable — left as-is, it just
+    fails to match, which is the safe direction.
+    """
+    s = str(raw or "").strip()
+    return s.lstrip("0") or s
+
+
+_SCI_NOTATION = re.compile(r"^\d(?:\.\d+)?[Ee][+-]?\d+$")
+
+
+def _is_mangled_id(raw: Any) -> bool:
+    """Did Excel turn this identifier into scientific notation?
+
+    A long Lowe's order number saved through Excel comes back as '3.00902E+17'.
+    The original digits are GONE — this is not recoverable in code, so the only
+    honest response is to say so loudly. Such a row cannot be deduplicated,
+    which means a re-import will book it twice.
+    """
+    return bool(_SCI_NOTATION.fullmatch(str(raw or "").strip()))
+
+
+def _ensure_ledger_schema(path: Path) -> list[str]:
+    """Bring an existing ledger up to the current columns and date format.
+
+    Old ledgers were written before `_norm_date()` existed and before net_paid
+    was a column, so they carry dates like '9/4/26' that break every date filter
+    and range header downstream. Repair in place — backing the original up
+    first — rather than leaving the user to notice bad ranges on their own.
+
+    Returns human-readable notes about anything changed or worth knowing.
+    """
+    notes: list[str] = []
+    if not path.is_file():
+        return notes
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            header = list(reader.fieldnames or [])
+            rows = [dict(r) for r in reader]
+    except Exception as e:
+        return [f"could not read the ledger to check it: {type(e).__name__}: {e}"]
+    if not header:
+        return notes
+
+    missing = [c for c in _LEDGER_COLUMNS if c not in header]
+    bad_dates = 0
+    for r in rows:
+        raw = (r.get("date") or "").strip()
+        fixed = _norm_date(raw)
+        if fixed and fixed != raw:
+            r["date"] = fixed
+            bad_dates += 1
+
+    # Rows written before non-job labels had their own categories all sit in one
+    # "no job on receipt" bucket, which is the bucket that answers nothing. The
+    # label and the description are both still in the file, so the category can
+    # be re-derived rather than left lumped.
+    recategorised = 0
+    threshold = float((_load_config().get("job_cost_import") or {})
+                      .get("tool_threshold_dollars", 150.0))
+    for r in rows:
+        if (r.get("category") or "").strip() not in ("no job on receipt", ""):
+            continue
+        label = (r.get("job_on_receipt") or "").strip().upper()
+        cat, _why = _item_category((r.get("description") or "").lower(), "",
+                                   abs(_money(r.get("amount"))), threshold)
+        if not cat:
+            cat = _LABEL_CATEGORY.get(label, "")
+        if not cat and (label in _UNASSIGNED_LABELS
+                        or not re.fullmatch(r"[0-9][0-9\-]*", label)):
+            cat = "unassigned — needs review"
+        if cat and cat != r.get("category"):
+            r["category"] = cat
+            recategorised += 1
+
+    mangled = sum(1 for r in rows if _is_mangled_id(r.get("receipt")))
+    if mangled:
+        notes.append(
+            f"{mangled} row(s) have an Excel-mangled receipt id (like "
+            f"'3.00902E+17'). Those digits are lost, so those rows cannot be "
+            f"deduplicated — re-export the file as CSV without opening it in "
+            f"Excel if you need to re-import them.")
+
+    if not missing and not bad_dates and not recategorised:
+        return notes
+    stamp = dt.now().strftime("%Y%m%d%H%M%S")
+    backup = path.with_suffix(f".bak-{stamp}.csv")
+    try:
+        backup.write_bytes(path.read_bytes())
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(_LEDGER_COLUMNS),
+                                    extrasaction="ignore")
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({c: r.get(c, "") for c in _LEDGER_COLUMNS})
+    except Exception as e:
+        return notes + [f"could not repair the ledger: {type(e).__name__}: {e}"]
+    if missing:
+        notes.append(f"added column(s) {', '.join(missing)} to the ledger")
+    if bad_dates:
+        notes.append(f"normalised {bad_dates} date(s) to YYYY-MM-DD")
+    if recategorised:
+        notes.append(f"sorted {recategorised} older row(s) out of the single "
+                     f"'no job on receipt' bucket into real categories")
+    notes.append(f"original backed up to {backup.name}")
+    return notes
+
+
 def _ledger_existing_keys(path: Path) -> set:
     if not path.is_file():
         return set()
@@ -4720,16 +4863,20 @@ def _ledger_existing_keys(path: Path) -> set:
     try:
         with open(path, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
-                keys.add((row.get("vendor", ""), row.get("receipt", ""),
+                keys.add((row.get("vendor", ""), _rid(row.get("receipt")),
                           row.get("sku", ""), row.get("description", "")))
     except Exception:
         pass
     return keys
 
 
-def _append_overhead(vendor: str, entries: list[dict]) -> tuple[int, Path]:
-    """Append non-job lines, skipping any already recorded. Returns (written, path)."""
+def _append_overhead(vendor: str, entries: list[dict]) -> tuple[int, Path, list[str]]:
+    """Append non-job lines, skipping any already recorded.
+
+    Returns (written, path, notes) — notes covers any ledger repair that ran.
+    """
     path = _ledger_path()
+    notes = _ensure_ledger_schema(path)
     seen = _ledger_existing_keys(path)
     fresh = []
     for e in entries:
@@ -4737,32 +4884,35 @@ def _append_overhead(vendor: str, entries: list[dict]) -> tuple[int, Path]:
         desc = _pick(r, "desc")[:120]
         sku = _pick(r, "sku")
         receipt = _pick(r, "receipt")
-        if (vendor, receipt, sku, desc) in seen:
+        if (vendor, _rid(receipt), sku, desc) in seen:
             continue
-        seen.add((vendor, receipt, sku, desc))
+        seen.add((vendor, _rid(receipt), sku, desc))
         fresh.append({
             "date": _norm_date(_pick(r, "date")),
             "vendor": vendor,
             "receipt": receipt,
-            "category": _overhead_category(e.get("bucket", "general"), e["why"]),
+            "category": _overhead_category(e.get("bucket", "general"), e["why"],
+                                           e.get("category", "")),
             "reason": e["why"],
             "description": desc,
             "sku": sku,
             "quantity": _pick(r, "qty") or "1",
-            "amount": f"{abs(_money(_pick(r, 'amount'))):.2f}",
+            "amount": f"{abs(_amt(r)):.2f}",
+            "net_paid": f"{abs(_net(r)):.2f}",
             "purchaser": _pick(r, "purchaser"),
             "job_on_receipt": _pick(r, "job"),
         })
     if not fresh:
-        return 0, path
+        return 0, path, notes
     path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not path.is_file()
     with open(path, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(_LEDGER_COLUMNS))
+        writer = csv.DictWriter(fh, fieldnames=list(_LEDGER_COLUMNS),
+                                extrasaction="ignore")
         if is_new:
             writer.writeheader()
         writer.writerows(fresh)
-    return len(fresh), path
+    return len(fresh), path, notes
 
 # ── Supplier receipt import ────────────────────────────────────────────────────
 #
@@ -4823,8 +4973,7 @@ _CONSUMABLE_WORDS = ("blade", "bit", "abrasive", "sanding", "disc", "brush",
 _SKIP_CATEGORY_WORDS = ("CONVENIENCE", "BEVERAGE", "SNACK", "CANDY",
                         "FRONT END", "TOBACCO")
 _SKIP_DEPT_WORDS = ("FEES", "DELIVERY FEE", "SHIPPING")
-_NON_JOB_LABELS = {"", "0", "00", "000", "VAN", "SHOP", "STOCK", "OFFICE",
-                   "N/A", "NONE", "NA"}
+_NON_JOB_LABELS = set(_LABEL_CATEGORY) | _UNASSIGNED_LABELS
 
 # Column aliases so other suppliers can be added without new code.
 # Order matters: the FIRST alias present in the file wins.
@@ -4851,7 +5000,12 @@ _COL_ALIASES = {
     "amount":     ("Extended Retail (before discount)", "Extended Price",
                    "Total Price", "Line Total", "Net Amount", "Extended Retail",
                    "Amount", "Price"),
-    "unit":       ("Net Unit Price", "Unit Price", "Item Price"),
+    # PER-UNIT prices only. Home Depot's "Net Unit Price" is deliberately NOT
+    # here: despite the name it carries the LINE's net total, verified on a
+    # qty-10 oak board line reading $51.90 where the per-board price is $5.19.
+    # Listing it made the sanity check below compare extended against extended
+    # and conclude the amount column was a unit price.
+    "unit":       ("Unit Price", "Item Price"),
     "department": ("Department Name", "Department", "Dept", "Category"),
     "klass":      ("Class Name", "Class", "Sub Category"),
     "subclass":   ("Subclass Name", "Subclass", "Product Group"),
@@ -4860,6 +5014,184 @@ _COL_ALIASES = {
     "receipt":    ("Invoice Number", "Order Number", "Transaction ID",
                    "Receipt", "Receipt Number"),
 }
+
+
+# ── config-driven rules ────────────────────────────────────────────────────────
+#
+# Every list above is a DEFAULT, and config.json can extend any of them. This
+# used to be documented and not true: config.example.json described ten keys and
+# the code read four, so a rule added to the file failed silently and looked
+# like it had worked. Adding RAFFLE to non_job_labels genuinely did nothing.
+#
+# Merge semantics are EXTEND, never replace. The built-ins encode calls already
+# made and verified against real receipts, and a company that lists three of its
+# own labels almost certainly still wants VAN and N/A to keep working. To
+# override in the other direction — force something ONTO a job that a built-in
+# rule pulls off — use always_job_keywords, which outranks every rule below.
+#
+# The one exception is supplier_column_aliases, where config aliases go FIRST:
+# first match wins for columns, so naming a column is how you steer which one is
+# read, and that only works if yours is consulted before the defaults.
+
+_RULE_KEYS = (
+    ("non_job_labels", "job-column values meaning 'not a job'"),
+    ("skip_classes", "supplier classes never a job cost"),
+    ("skip_subclasses", "supplier subclasses never a job cost"),
+    ("skip_departments", "supplier departments never a job cost"),
+    ("equipment_keywords", "equipment you keep — overhead at any price"),
+    ("van_stock_keywords", "always van restock"),
+    ("ambiguous_keywords", "could be either — routed to you"),
+    ("always_job_keywords", "pinned to the job, outranks everything"),
+    ("always_general_keywords", "pinned to overhead"),
+    ("supplier_column_aliases", "column names per supplier"),
+    ("amount_rules", "which columns carry gross and discounts"),
+)
+
+_RULES: dict = {}
+
+
+def _merge_words(cfg: dict, key: str, builtin: tuple) -> tuple:
+    """Built-in list extended by config, de-duplicated case-insensitively."""
+    extra = cfg.get(key) or []
+    if isinstance(extra, str):
+        extra = [extra]
+    out = list(builtin)
+    have = {str(w).strip().lower() for w in out}
+    for w in extra:
+        w = str(w).strip()
+        if w and w.lower() not in have:
+            out.append(w)
+            have.add(w.lower())
+    return tuple(out)
+
+
+def _refresh_rules() -> dict:
+    """Re-resolve rules from config. Called at the top of each import tool, so
+    editing config.json takes effect without restarting Claude."""
+    cfg = _load_config().get("job_cost_import") or {}
+    labels = {str(v).strip().upper()
+              for v in (cfg.get("non_job_labels") or []) if v is not None}
+    aliases = {}
+    cfg_alias = cfg.get("supplier_column_aliases") or {}
+    for key, builtin in _COL_ALIASES.items():
+        mine = cfg_alias.get(key) or []
+        if isinstance(mine, str):
+            mine = [mine]
+        ordered = [str(c).strip() for c in mine if str(c).strip()]
+        for c in builtin:
+            if c not in ordered:
+                ordered.append(c)
+        aliases[key] = tuple(ordered)
+
+    amount_rules = dict(_AMOUNT_RULES)
+    for name, rule in (cfg.get("amount_rules") or {}).items():
+        if isinstance(rule, dict) and not name.startswith("_"):
+            amount_rules[name] = rule
+
+    _RULES.clear()
+    _RULES.update({
+        "cfg": cfg,
+        "non_job_labels": frozenset(_NON_JOB_LABELS | labels),
+        "label_category": _LABEL_CATEGORY,
+        "unassigned": frozenset(_UNASSIGNED_LABELS),
+        "skip_category": _merge_words(
+            cfg, "skip_classes",
+            _merge_words(cfg, "skip_subclasses", _SKIP_CATEGORY_WORDS)),
+        "skip_dept": _merge_words(cfg, "skip_departments", _SKIP_DEPT_WORDS),
+        "equipment": _merge_words(cfg, "equipment_keywords", _EQUIPMENT_WORDS),
+        "van_stock": _merge_words(cfg, "van_stock_keywords", _VAN_STOCK_WORDS),
+        "ambiguous": _merge_words(cfg, "ambiguous_keywords", _AMBIGUOUS_WORDS),
+        "aliases": aliases,
+        "amount_rules": amount_rules,
+        # config keys that are present AND non-empty, for hcp_check_setup
+        "in_force": [k for k, _ in _RULE_KEYS if cfg.get(k)],
+        "dead": [k for k, _ in _RULE_KEYS
+                 if k in cfg and not cfg.get(k)],
+    })
+    return _RULES
+
+
+def _rules() -> dict:
+    return _RULES or _refresh_rules()
+
+
+# ── amount basis ───────────────────────────────────────────────────────────────
+#
+# Home Depot bills at LIST and rebates the Pro Xtra discount separately, so its
+# "Extended Retail (before discount)" column is 15-18% above what the card was
+# actually charged. Nikki's standing decision (Sep 7) is to post RETAIL to jobs
+# and let the discount fall to gross margin, since that is what the customer was
+# quoted against — but the discount is still recorded, because it is the only
+# way to see whether the volume commitment is earning anything.
+#
+# The two discount columns use opposite sign conventions and both mean
+# "reduction": Pro Xtra volume discounts come through negative, promotional ones
+# positive. abs() on each, so neither convention can accidentally add.
+#
+# Lowe's and Sherwin-Williams need no rule — their totals are already net.
+_AMOUNT_RULES = {
+    "home depot": {
+        "gross": ("Extended Retail (before discount)", "Extended Retail"),
+        "subtract_abs": ("Program Discount Amount", "Other Discount Amount"),
+    },
+    # Lowe's needs no arithmetic — its Item Price is already post-discount and
+    # Total Price is the extended, tax-inclusive figure. But it does ship a
+    # "Total Discount" column, and that number is worth seeing: the benefit is
+    # already in the cost, which is to say already in gross margin, the same
+    # place Home Depot's ends up by the opposite route.
+    "lowes": {"report_discount": ("Total Discount",)},
+    "lowe's": {"report_discount": ("Total Discount",)},
+}
+
+
+def _amount_rule(vendor: str, rules: Optional[dict] = None) -> dict:
+    v = (vendor or "").strip().lower()
+    for name, rule in (rules or _rules())["amount_rules"].items():
+        if name.lower() in v or v in name.lower():
+            return rule
+    return {}
+
+
+def _first_col(row: dict, names) -> str:
+    if isinstance(names, str):
+        names = (names,)
+    for n in names:
+        if n in row and row[n] not in (None, ""):
+            return str(row[n]).strip()
+    return ""
+
+
+def _row_amounts(row: dict, vendor: str, basis: str = "retail",
+                 rules: Optional[dict] = None) -> tuple[float, float]:
+    """(amount_to_post, net_actually_paid) for one receipt line.
+
+    Both are signed, so a credit stays negative. The discount reduces the
+    magnitude rather than the signed value — a $57 return with a $5 discount on
+    it was a $52 credit, not a $62 one.
+    """
+    rule = _amount_rule(vendor, rules)
+    gross = _money(_first_col(row, rule.get("gross") or ())) if rule else 0.0
+    if not gross:
+        gross = _money(_pick(row, "amount"))
+    if not rule:
+        return gross, gross
+    cut = sum(abs(_money(_first_col(row, (c,))))
+              for c in (rule.get("subtract_abs") or ()))
+    sign = -1.0 if gross < 0 else 1.0
+    net = sign * max(abs(gross) - cut, 0.0)
+    return (gross, net) if basis == "retail" else (net, net)
+
+
+def _amt(row: dict) -> float:
+    """The amount this line posts at — annotated once by _read_receipt_csv."""
+    v = row.get("__amt")
+    return float(v) if v is not None else _money(_pick(row, "amount"))
+
+
+def _net(row: dict) -> float:
+    """What was actually paid for this line, after supplier discounts."""
+    v = row.get("__net")
+    return float(v) if v is not None else _amt(row)
 
 
 _MONTHS = {m: i for i, m in enumerate(
@@ -4924,14 +5256,15 @@ def _money(raw: Any) -> float:
 
 
 def _pick(row: dict, key: str) -> str:
-    for name in _COL_ALIASES[key]:
+    for name in _rules()["aliases"][key]:
         if name in row and row[name] not in (None, ""):
             return str(row[name]).strip()
     return ""
 
 
-def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
-    """Rows plus a vendor label, skipping any preamble above the real header."""
+def _read_receipt_csv(path: str, basis: str = "retail",
+                      vendor_label: str = "") -> tuple[list[dict], str, dict]:
+    """Rows plus a vendor label and a health report on the file itself."""
     # Supplier exports are frequently Windows-encoded rather than UTF-8 — Home
     # Depot's are cp1252, where a degree sign in "16-Gauge 20° Nails" decodes to
     # a replacement character under UTF-8 and lands in the material name.
@@ -4969,9 +5302,10 @@ def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
                 vendor = known
                 break
     header_idx = 0
+    known = _rules()["aliases"].values()
     for i, ln in enumerate(lines[:40]):
         cells = [c.strip().strip('"') for c in ln.split(",")]
-        if sum(1 for c in cells if any(c in names for names in _COL_ALIASES.values())) >= 4:
+        if sum(1 for c in cells if any(c in names for names in known)) >= 4:
             header_idx = i
             break
     reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
@@ -5035,27 +5369,144 @@ def _read_receipt_csv(path: str) -> tuple[list[dict], str]:
             if c in r:
                 r[c] = inherited
                 break
-    return rows, vendor
+
+    # ── annotate the money once, here, where the vendor is known ─────────────
+    # Every downstream reader takes the amount through _amt()/_net() rather than
+    # re-deriving it, so the retail-vs-net decision is made in exactly one place
+    # and cannot drift between the preview and what actually posts.
+    label = (vendor_label or vendor or "").strip()
+    rules = _rules()
+    for r in rows:
+        post, net = _row_amounts(r, label, basis, rules)
+        r["__amt"] = post
+        r["__net"] = net
+
+    # ── health checks on the file itself ─────────────────────────────────────
+    # A supplier renaming a column used to degrade in silence: _pick() returned
+    # "", every line fell to "no job on the receipt", and the run looked like a
+    # clean overhead-only import. These make that loud instead.
+    health: dict = {"vendor": label, "basis": basis, "warnings": [],
+                    "fatal": []}
+    header_cols = set(rows[0].keys()) if rows else set()
+    health["columns"] = {
+        key: next((c for c in rules["aliases"][key] if c in header_cols), "")
+        for key in rules["aliases"]
+    }
+    total = len(rows)
+    labels = rules["non_job_labels"]
+    nojob = sum(1 for r in rows
+                if _pick(r, "job").upper() in labels
+                or not re.fullmatch(r"[0-9][0-9\-]*", _pick(r, "job").upper()))
+    health["no_job_share"] = nojob / total if total else 0.0
+    # Only a missing job or amount column is FATAL. Everything else warns —
+    # a heuristic that can be wrong must not be able to refuse a good file.
+    if not health["columns"]["job"]:
+        health["fatal"].append(
+            "no job/PO column recognised — every line will look like overhead. "
+            "Add the column name under job_cost_import.supplier_column_aliases.job")
+    if not health["columns"]["amount"]:
+        health["fatal"].append(
+            "no amount column recognised — nothing can be valued")
+
+    # Does the "amount" column actually hold an extended total, or a unit price?
+    # Sherwin-Williams calls its extended total plain "Price", so the two are
+    # indistinguishable by name — the only tell is whether it scales with
+    # quantity on multi-quantity lines.
+    #
+    # First establish that the unit column IS per-unit. Some suppliers ship an
+    # extended figure under a per-unit name, and comparing two extended columns
+    # to each other proves nothing.
+    priced = [r for r in rows if _money(_pick(r, "unit"))]
+    unit_is_extended = (
+        sum(1 for r in priced
+            if abs(abs(_money(_pick(r, "unit"))) - abs(_net(r))) < 0.01)
+        / len(priced) > 0.8) if len(priced) >= 5 else False
+    multi = [r for r in rows if _money(_pick(r, "qty")) > 1]
+    if len(multi) >= 6 and not unit_is_extended:
+        unitish = sum(
+            1 for r in multi
+            if (u := _money(_pick(r, "unit"))) > 0
+            and abs(abs(_amt(r)) - u) < 0.01
+            and abs(abs(_amt(r)) - u * _money(_pick(r, "qty"))) > 0.01)
+        if unitish / len(multi) > 0.5:
+            health["warnings"].append(
+                f"the amount column ({health['columns']['amount']}) may be a "
+                f"UNIT price rather than a line total — {unitish} of {len(multi)} "
+                f"multi-quantity lines match the unit price exactly, which would "
+                f"understate costs. Worth checking against a paper receipt, and "
+                f"correcting supplier_column_aliases.amount if so.")
+
+    # Byte-identical repeat rows. Correct to sum if the register really rang the
+    # item twice, wrong if the export duplicated it — either way it should be
+    # visible rather than absorbed.
+    fingerprints: dict[tuple, int] = {}
+    for r in rows:
+        fp = (_pick(r, "date"), _pick(r, "receipt"), _pick(r, "sku"),
+              _pick(r, "qty"), f"{_amt(r):.2f}")
+        fingerprints[fp] = fingerprints.get(fp, 0) + 1
+    repeats = {fp: n for fp, n in fingerprints.items() if n > 1 and fp[1]}
+    health["repeat_rows"] = sum(n - 1 for n in repeats.values())
+    health["repeat_groups"] = len(repeats)
+
+    health["mangled_ids"] = sorted({
+        _pick(r, "receipt") for r in rows if _is_mangled_id(_pick(r, "receipt"))})
+    if health["mangled_ids"]:
+        health["warnings"].append(
+            f"{len(health['mangled_ids'])} receipt id(s) came through Excel as "
+            f"scientific notation ({', '.join(health['mangled_ids'][:2])}) — the "
+            f"real digits are gone, so these lines cannot be deduplicated and a "
+            f"second import would double them. Re-export as CSV without opening "
+            f"it in Excel.")
+    return rows, vendor, health
+
+
+def _item_category(low: str, klass: str, amount: float,
+                   threshold: float) -> tuple[str, str]:
+    """(ledger category, reason) from the ITEM alone, or ('','') if it says nothing.
+
+    Shared by the classifier's two paths so a tool is called a tool whether or
+    not anyone wrote a job number next to it.
+    """
+    R = _rules()
+    if (klass in _TOOL_CLASSES or klass in _KEEP_TOOL_CLASSES
+            or _word_hit(low, _TOOL_WORDS)) and not _word_hit(low, _CONSUMABLE_WORDS):
+        if klass in _KEEP_TOOL_CLASSES:
+            return "tools", f"hand tool (${amount:,.2f})"
+        if amount >= threshold:
+            return "tools", f"tool purchase ${amount:,.2f}"
+        return "tools", f"small tool ${amount:,.2f}"
+    if _word_hit(low, R["equipment"]):
+        return "equipment", f"equipment you keep (${amount:,.2f})"
+    if _word_hit(low, R["van_stock"]):
+        return "van stock", "van stock — restocked regardless of job"
+    return "", ""
 
 
 def _classify(row: dict, tool_threshold: float,
               supplies: str = "review",
-              always_job: tuple = (), always_general: tuple = ()
-              ) -> tuple[str, str]:
-    """(bucket, why) — bucket is 'job', 'general', 'skip' or 'review'."""
+              always_job: tuple = (), always_general: tuple = (),
+              tools: str = "review",
+              ) -> tuple[str, str, str]:
+    """(bucket, why, category) — bucket is 'job', 'general', 'skip' or 'review'.
+
+    `category` is set only when the line's overhead category is already known
+    rather than inferred from the reason text — a receipt labelled RAFFLE is
+    charity spend, and there is nothing to guess about it.
+    """
+    R = _rules()
     desc = _pick(row, "desc")
     low = desc.lower()
     klass = _pick(row, "klass").upper()
     sub = _pick(row, "subclass").upper()
     dept = _pick(row, "department").upper()
     job = _pick(row, "job").upper()
-    amount = abs(_money(_pick(row, "amount")))
+    amount = abs(_amt(row))
 
     haystack = " | ".join((dept, klass, sub))
-    if any(w in haystack for w in _SKIP_CATEGORY_WORDS):
-        return "skip", "food or drink, not a job cost"
+    if any(w.upper() in haystack for w in R["skip_category"]):
+        return "skip", "food or drink, not a job cost", "food and drink"
     if amount == 0:
-        return "skip", "$0 line (bundle component or fee)"
+        return "skip", "$0 line (bundle component or fee)", ""
     # Delivery, freight and shipping are a real cost OF the job the material was
     # delivered for, so a fee line FOLLOWS ITS JOB NUMBER rather than being
     # dropped — Nikki's rule, Sep 6: "delivery fee on a job is applied to that
@@ -5069,23 +5520,46 @@ def _classify(row: dict, tool_threshold: float,
     # Food and drink are the opposite case and are skipped above whatever the
     # receipt says — a crew's energy drink is not a cost of the job it was
     # charged to.
-    is_fee = any(w in haystack for w in _SKIP_DEPT_WORDS)
+    is_fee = any(w.upper() in haystack for w in R["skip_dept"])
 
-    if job in _NON_JOB_LABELS:
-        label = job or "blank"
+    # A label the team actually uses — VAN, RAFFLE, SHOP — is an ANSWER, not a
+    # missing value, and each gets its own ledger category so raffle baskets do
+    # not sit in the same bucket as truck restock. An explicit label OUTRANKS
+    # what the item looks like, because it is a person stating the purpose: a
+    # drill in a RAFFLE basket is charity spend, not tooling.
+    if job in R["label_category"]:
+        cat = R["label_category"][job]
         if is_fee:
-            return "skip", "fee or delivery line with no job on it"
-        return "general", f"no job on the receipt (job field = {label})"
+            return "skip", f"fee or delivery line, {cat} (job field = {job})", ""
+        return "general", f"{cat} (job field = {job})", cat
+
+    def _unlabelled(reason: str) -> tuple[str, str, str]:
+        """No job and no label — say what the ITEM is, then note it is unlabelled.
+
+        A blank or 0 is an absence rather than a statement, so the item gets to
+        speak. Without this a $911 M18 order landed in "unassigned" purely
+        because nobody filled the field in, and it was invisible to any question
+        about how fast tools are being bought.
+        """
+        cat, why = _item_category(low, klass, amount, tool_threshold)
+        if cat:
+            return "general", f"{why} — {reason}", cat
+        return "general", f"nobody labelled this ({reason})", "unassigned — needs review"
+
+    if job in R["non_job_labels"]:
+        if is_fee:
+            return "skip", "fee or delivery line with no job on it", ""
+        return _unlabelled(f"job field = {job or 'blank'}")
     # Some exports put an account or company name where the job should be
     # (Sherwin-Williams fills "Job Name" with the company on every line). A job
     # reference is a number here, so anything else means we do not know the job.
     if not re.fullmatch(r"[0-9][0-9\-]*", job):
         if is_fee:
-            return "skip", "fee or delivery line with no usable job on it"
-        return "general", f"no usable job reference on the receipt ({job[:24]})"
+            return "skip", "fee or delivery line with no usable job on it", ""
+        return _unlabelled(f"no usable job reference, {job[:20]!r}")
 
     if is_fee:
-        return "job", ""
+        return "job", "", ""
 
     # Company-specific pins beat EVERY rule below, the tool classes included.
     # This list is where you record a call you have already made and do not want
@@ -5095,31 +5569,244 @@ def _classify(row: dict, tool_threshold: float,
     # job-number checks and not above them, because no pin can put a line on a
     # job the receipt never named.
     if _word_hit(low, always_job):
-        return "job", ""
+        return "job", "", ""
 
     looks_tool = (klass in _TOOL_CLASSES or klass in _KEEP_TOOL_CLASSES
                   or _word_hit(low, _TOOL_WORDS))
     if looks_tool and not _word_hit(low, _CONSUMABLE_WORDS):
         if klass in _KEEP_TOOL_CLASSES:
-            return "general", f"hand tool — shop stock at any price (${amount:,.2f})"
+            return ("general",
+                    f"hand tool — shop stock at any price (${amount:,.2f})", "tools")
         if amount >= tool_threshold:
-            return "general", f"tool purchase ${amount:,.2f} — overhead, not one job"
-        return "review", f"small tool ${amount:,.2f} — job cost or shop stock?"
+            return ("general",
+                    f"tool purchase ${amount:,.2f} — overhead, not one job", "tools")
+        # Small tools have their OWN route. They used to land in review and be
+        # untouched by supplies=, which reads as "job cost or shop stock?" and
+        # then silently posts nothing — $195 of batteries and vac filters sat
+        # unposted on one run with no line in the summary saying so.
+        if tools == "job":
+            return "job", "", ""
+        if tools == "general":
+            return ("general",
+                    f"small tool ${amount:,.2f}, treated as shop stock this run",
+                    "tools")
+        return "review", f"small tool ${amount:,.2f} — job cost or shop stock?", ""
 
     if _word_hit(low, always_general):
-        return "general", "van stock (your rule)"
+        return "general", "van stock (your rule)", "van stock"
 
-    if _word_hit(low, _EQUIPMENT_WORDS):
-        return "general", f"equipment you keep — overhead at any price (${amount:,.2f})"
-    if _word_hit(low, _VAN_STOCK_WORDS):
-        return "general", "van stock — restocked regardless of job"
-    if _word_hit(low, _AMBIGUOUS_WORDS):
+    if _word_hit(low, R["equipment"]):
+        return ("general",
+                f"equipment you keep — overhead at any price (${amount:,.2f})",
+                "equipment")
+    if _word_hit(low, R["van_stock"]):
+        return "general", "van stock — restocked regardless of job", "van stock"
+    if _word_hit(low, R["ambiguous"]):
         if supplies == "job":
-            return "job", ""
+            return "job", "", ""
         if supplies == "general":
-            return "general", "consumable, treated as van stock this run"
-        return "review", "job material or van stock? same item can be either"
-    return "job", ""
+            return ("general", "consumable, treated as van stock this run",
+                    "van stock")
+        return "review", "job material or van stock? same item can be either", ""
+    return "job", "", ""
+
+# ── does this item belong on this job? ────────────────────────────────────────
+#
+# Nothing used to compare WHAT was bought against WHAT THE JOB IS, so a $64
+# keypad deadbolt and a door knob posted onto a $200 bedroom drywall repair and
+# pushed it to 2128% of its materials allowance. The three genuine drywall items
+# on the same receipt were fine; the door hardware was a mis-tagged PO.
+#
+# The signal is the job's own materials line-item description. LHSTL quotes are
+# unusually detailed — "Roller covers, brush or edger, bucket, tray liners" —
+# which makes them a real vocabulary to test an item against. But plenty of jobs
+# bill a generic "List of Materials", and that carries NO signal, so the check
+# only runs where the quote is descriptive enough to have an opinion.
+#
+# Two more gates keep this from crying wolf: the job has to be heading past its
+# materials allowance, and universally-used consumables are never held.
+
+# Words that appear in every LHSTL scope and therefore distinguish nothing.
+# The quotes are long — 100 to 150 distinct words each — and most of that is
+# assumptions boilerplate. Left in, a keypad deadbolt "matched" a ceiling-fan
+# job on the word "hardware".
+_TERM_STOP = frozenset("""
+list lists material materials misc miscellaneous supplies supply cost costs
+allowance allowances included include includes including excluded excludes
+needed need needs various assorted customer client home depot lowes lowe
+sherwin williams store item items each labor hours hour trip charge charges
+fee fees total price pricing quote quoted estimate work works project note
+notes scope assumptions assumption condition conditions
+and are was will not any all per the this that they them their there then than
+with from into onto over under above below for out off you your our his her
+its who whom whose which what when where while have has had been being
+can could may might must shall should would does did done else both each some
+none only also such same other others more most less least very much many few
+new old one two three four five ten
+provide provided provides install installs installed installation remove
+removal removed replace replaces replaced repair repairs repaired existing
+access accessible adequate additional appropriate proper properly necessary
+standard required require requires area areas location locations surface
+surfaces visible hidden damage damaged prior during after before unless
+otherwise noted based current available assumes assumed adjacent approximately
+apply applied application add adds added along area back
+team tech techs crew day days time times site sites onsite
+original purpose protection protect premium heavy duty grip pack piece pieces
+random length universal point count size sizes style finish color colors
+""".split())
+
+# Items that belong to the same trade read as related even when they share no
+# word. Primer is not the word "paint", but it is paint work.
+_KIN_GROUPS = (
+    {"paint", "painting", "primer", "prime", "stain", "sealer", "topcoat",
+     "sheen", "eggshell", "satin", "semi", "gloss", "gallon", "quart",
+     "roller", "brush", "tray", "edger", "cutin", "latex", "enamel"},
+    {"drywall", "sheetrock", "gypsum", "joint", "compound", "mud", "tape",
+     "corner", "bead", "texture", "patch", "spackle", "sand", "skim"},
+    {"deck", "decking", "joist", "railing", "baluster", "picket", "post",
+     "treated", "lumber", "board", "stringer", "riser", "tread", "framing"},
+    {"door", "doors", "knob", "deadbolt", "lockset", "hinge", "strike",
+     "jamb", "casing", "threshold", "sweep", "closer", "handleset"},
+    {"tile", "grout", "thinset", "backer", "mortar", "trowel", "spacer",
+     "membrane", "sealant"},
+    {"electrical", "outlet", "receptacle", "switch", "wire", "romex",
+     "breaker", "panel", "gfci", "conduit", "junction", "fixture", "light",
+     "lighting", "dimmer", "wago"},
+    {"plumbing", "faucet", "valve", "supply", "trap", "drain", "flange",
+     "toilet", "sink", "vanity", "shutoff", "pipe", "pvc", "cpvc", "shark",
+     "compression", "escutcheon"},
+    {"fence", "fencing", "gate", "concrete", "gravel", "quikrete", "rebar",
+     "bracket"},
+    {"trim", "baseboard", "molding", "moulding", "quarter", "round", "shoe",
+     "crown", "chair", "rail", "casing"},
+    {"roof", "roofing", "shingle", "flashing", "underlayment", "ridge",
+     "soffit", "fascia", "gutter", "downspout"},
+    {"cabinet", "cabinets", "drawer", "slide", "pull", "shelf", "shelving",
+     "closet", "rod", "bracket", "melamine"},
+    {"window", "windows", "glass", "glazing", "screen", "sash", "sill",
+     "weatherstrip"},
+    {"insulation", "batt", "foam", "vapor", "barrier", "housewrap"},
+    {"siding", "soffit", "trim", "hardie", "vinyl", "starter"},
+    {"floor", "flooring", "underlayment", "transition", "vinyl", "laminate",
+     "plank", "subfloor", "register"},
+)
+
+# Bought on nearly every job of every kind, so their presence says nothing about
+# whether the receipt was tagged correctly. Never held.
+_UNIVERSAL_ITEMS = ("screw", "screws", "nail", "nails", "fastener", "anchor",
+                    "washer", "bolt", "nut", "staple", "adhesive", "glue",
+                    "caulk", "sealant", "silicone", "tape", "sandpaper",
+                    "abrasive", "blade", "bit", "shim", "liner", "drop cloth",
+                    "tarp", "plastic", "sponge", "bucket", "rag", "wipe")
+
+
+def _terms(*texts: str) -> set:
+    """Meaningful words in a description, for comparing an item to a job."""
+    out = set()
+    for t in texts:
+        for w in re.findall(r"[a-z]{3,}", (t or "").lower()):
+            if w not in _TERM_STOP:
+                out.add(w)
+    return out
+
+
+# Where a quote stops describing the work and starts listing what it will NOT
+# do. Everything after this is the opposite of scope, and reading it as scope
+# inverts the answer: job #532's garage ceiling repair names "electrical
+# wiring" only to say it is priced separately, and on those words a $220 box of
+# GFCI outlets passed as belonging to a drywall patch.
+_EXCLUSION_MARKERS = (
+    "exclusion", "excluded", "not included", "does not include",
+    "doesn't include", "out of scope", "priced separately",
+    "separate estimate", "separate quote", "if needed", "if required",
+)
+
+
+def _job_text(*texts: str) -> set:
+    """A job's vocabulary, counting only what it says it WILL do."""
+    kept = []
+    for t in texts:
+        low = (t or "").lower()
+        cut = min((low.find(m) for m in _EXCLUSION_MARKERS if m in low),
+                  default=-1)
+        kept.append(low[:cut] if cut > 0 else low)
+    return _terms(*kept)
+
+
+def _kin(terms: set) -> set:
+    """Which trades a set of words touches."""
+    return {i for i, g in enumerate(_KIN_GROUPS) if terms & g}
+
+
+def _shared(a: set, b: set) -> set:
+    """Words in common, allowing singular/plural and simple compounds."""
+    hit = a & b
+    for x in a:
+        if x in hit or len(x) < 5:
+            continue
+        for y in b:
+            if len(y) >= 5 and (x in y or y in x):
+                hit.add(x)
+                break
+    return hit
+
+
+def _item_terms(row: dict) -> set:
+    """Words identifying the ITEM — its own name, not the aisle it came from.
+
+    Department and class are deliberately excluded here. They are generic
+    ("HARDWARE", "TOOLS", "PAINT") and matching on them let a deadbolt pass as
+    part of a ceiling-fan job. They still get a say through _fits, but only for
+    the looser trade test.
+    """
+    return _terms(_pick(row, "desc"))
+
+
+def _fits(row: dict, job_terms: set, job_kin: set) -> tuple[bool, set]:
+    """(does this item read as part of that job, the words they share)"""
+    low = _pick(row, "desc").lower()
+    if _word_hit(low, _UNIVERSAL_ITEMS):
+        return True, set()
+    common = _shared(_item_terms(row), job_terms)
+    if common:
+        return True, common
+    # Same trade counts even with no word in common — primer is not the word
+    # "paint" but it is paint work. Here the store's own department helps.
+    wide = _terms(_pick(row, "desc"), _pick(row, "department"),
+                  _pick(row, "klass"), _pick(row, "subclass"))
+    return bool(_kin(wide) & job_kin), set()
+
+
+def _route_spec(spec: Optional[str], what: str) -> tuple[str, dict, str]:
+    """Parse a routing argument into (global_mode, per_job_overrides, error).
+
+    Accepts a plain mode — 'review', 'job', 'general' — or a per-job form,
+    'job:442,480;general:408', because one decision across a 600-line file with
+    fourteen jobs on it is coarser than the evidence. A per-job form leaves
+    every job not named on the default.
+    """
+    text = (spec or "review").strip()
+    modes = ("review", "job", "general")
+    if text.lower() in modes:
+        return text.lower(), {}, ""
+    per: dict[str, str] = {}
+    for chunk in re.split(r"[;|]", text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            return "review", {}, (
+                f"{what} must be 'review', 'job', 'general', or a per-job list "
+                f"like \"job:442,480;general:408\" — could not read {chunk!r}")
+        mode, _, nums = chunk.partition(":")
+        mode = mode.strip().lower()
+        if mode not in modes:
+            return "review", {}, (
+                f"{what}: {mode!r} is not one of review, job, general")
+        for n in nums.replace(",", " ").split():
+            per[n.strip().upper()] = mode
+    return "review", per, ""
+
 
 def _job_window(job: dict) -> tuple[str, str]:
     """A job's scheduled span as (YYYY-MM-DD, YYYY-MM-DD); ('', '') if unscheduled."""
@@ -5177,7 +5864,7 @@ def _already_imported(m: dict, seen: set) -> bool:
     so relabelling the supplier does not make a re-import look like new work.
     """
     sku = str(m.get("sku") or "").strip()
-    return any((sku, str(r).strip()) in seen for r in (m.get("receipts") or ()))
+    return any((sku, _rid(r)) in seen for r in (m.get("receipts") or ()))
 
 
 def _receipt_marker(vendor: str, m: dict) -> str:
@@ -5196,6 +5883,9 @@ async def hcp_import_job_costs(
     vendor_label: Optional[str] = None,
     supplies: Optional[str] = "review",
     overhead_only: Optional[bool] = False,
+    tools: Optional[str] = "review",
+    allow_mismatch: Optional[str] = None,
+    amount_basis: Optional[str] = None,
 ) -> str:
     """
     Post material actuals onto jobs from a supplier purchase export.
@@ -5243,6 +5933,13 @@ async def hcp_import_job_costs(
     nowhere and is listed for you, rather than being guessed onto a job it can
     never be removed from.
 
+    DOES IT BELONG ON THAT JOB? A line whose item shares nothing with what the
+    job is — door hardware on a drywall repair — is HELD BACK rather than
+    posted, once the job is also heading past what it bills for materials. If
+    exactly one other job bought around the same date fits it and the tagged job
+    does not, the line is MOVED there and the move is reported. Anything less
+    clear-cut is listed for you and posts nowhere.
+
     Re-running is safe: each posted line records the receipt it came from, and
     lines already present on a job are skipped rather than duplicated.
 
@@ -5260,10 +5957,28 @@ async def hcp_import_job_costs(
         supplies: What to do with the ambiguous consumables —
                   'review' (default, decide yourself), 'job' (this receipt's
                   consumables were bought for the jobs), or 'general' (they
-                  were van restock)
+                  were van restock). Also takes a per-job form,
+                  "job:442,480;general:408", for a file where the answer
+                  differs by job.
+        tools: Same three options, for small tools under tool_threshold.
+               Separate from supplies= because a $145 battery and a $9 drill
+               bit are different questions.
+        allow_mismatch: Job numbers whose held "does this belong" lines should
+                        post anyway, comma-separated, or "all". Use after
+                        reading the held list.
+        amount_basis: 'retail' (default) posts Home Depot's list price and lets
+                      the Pro Xtra discount fall to gross margin. 'net' posts
+                      what the card was actually charged. Either way, both
+                      figures are reported and recorded.
     """
+    _refresh_rules()
+    basis = (amount_basis or (_rules()["cfg"].get("amount_basis") or "retail")
+             ).strip().lower()
+    if basis not in ("retail", "net"):
+        return "amount_basis must be 'retail' or 'net'."
     try:
-        rows, detected_vendor = _read_receipt_csv(csv_path)
+        rows, detected_vendor, health = _read_receipt_csv(
+            csv_path, basis, (vendor_label or "").strip())
     except FileNotFoundError:
         return f"❌ No file at {csv_path}"
     except Exception as e:
@@ -5272,20 +5987,63 @@ async def hcp_import_job_costs(
         return f"❌ No data rows found in {csv_path}."
 
     vendor = (vendor_label or detected_vendor or "Supplier").strip()
-    cfg_imp = (_load_config().get("job_cost_import") or {})
+    cfg_imp = _rules()["cfg"]
     threshold = float(tool_threshold if tool_threshold is not None
                       else cfg_imp.get("tool_threshold_dollars", 150.0))
-    route = (supplies or "review").strip().lower()
-    if route not in ("review", "job", "general"):
-        return "supplies must be 'review', 'job' or 'general'."
+    route, route_per, err = _route_spec(supplies, "supplies")
+    if err:
+        return err
+    trout, trout_per, err = _route_spec(tools, "tools")
+    if err:
+        return err
     always_job = tuple(w.lower() for w in (cfg_imp.get("always_job_keywords") or []))
     always_gen = tuple(w.lower() for w in (cfg_imp.get("always_general_keywords") or []))
     wanted = {j.strip().upper() for j in (only_jobs or "").split(",") if j.strip()}
+    mismatch_ok = {j.strip().upper()
+                   for j in (allow_mismatch or "").split(",") if j.strip()}
+    overrun_factor = float(cfg_imp.get("mismatch_overrun_factor", 1.25))
+    trip_days = int(cfg_imp.get("same_trip_days", 7))
 
-    buckets: dict[str, list[dict]] = {"job": [], "general": [], "skip": [], "review": []}
+    # ── a column mapping that has gone stale is not a small problem ──────────
+    # It presents as a successful overhead-only import: nothing errors, no job
+    # is named, and every dollar looks like van stock. Refuse rather than
+    # produce that, unless overhead is what was asked for.
+    if not overhead_only:
+        if health["fatal"] or health["no_job_share"] > 0.5:
+            out = [f"❌ Stopping before anything is posted — this file does not "
+                   f"read cleanly.", ""]
+            for w in health["fatal"] + health["warnings"]:
+                out.append(f"  • {w}")
+            if health["no_job_share"] > 0.5:
+                out.append(f"  • {health['no_job_share'] * 100:.0f}% of lines "
+                           f"resolve to no job at all, which usually means the "
+                           f"job/PO column was renamed or is empty")
+            out += ["",
+                    f"Columns recognised: "
+                    + ", ".join(f"{k}={v or '—'}" for k, v in
+                                sorted(health["columns"].items()) if k in
+                                ("job", "amount", "date", "desc", "qty")),
+                    "",
+                    "Fix the export or add the column names under "
+                    "job_cost_import.supplier_column_aliases, then re-run.",
+                    "To record the non-job spend anyway, run with "
+                    "overhead_only=True."]
+            return "\n".join(out)
+
+    def _route_for(row: dict, glob: str, per: dict) -> str:
+        if not per:
+            return glob
+        num = _pick(row, "job").upper()
+        return per.get(num) or per.get(num.split("-")[0]) or glob
+
+    buckets: dict[str, list[dict]] = {"job": [], "general": [], "skip": [],
+                                      "review": [], "mismatch": []}
     for r in rows:
-        bucket, why = _classify(r, threshold, route, always_job, always_gen)
-        buckets[bucket].append({"row": r, "why": why, "bucket": bucket})
+        bucket, why, cat = _classify(
+            r, threshold, _route_for(r, route, route_per), always_job,
+            always_gen, _route_for(r, trout, trout_per))
+        buckets[bucket].append({"row": r, "why": why, "bucket": bucket,
+                                "category": cat})
 
     # ── resolve the receipt's job numbers to HCP jobs ────────────────────────
     # This runs BEFORE netting, because one receipt job number can resolve to
@@ -5295,7 +6053,11 @@ async def hcp_import_job_costs(
     # and the purchase date answers it.
     wanted_bases = {w.split("-")[0] for w in wanted}
     receipt_nums = set()
-    for e in buckets["job"]:
+    # Every bucket that names a job, not just the postable one. The review and
+    # held lists used to group by the RAW receipt number while the posting
+    # section showed the resolved segment, so the same purchase appeared as
+    # #400 in one place and #400-2 in another.
+    for e in buckets["job"] + buckets["review"]:
         n = _pick(e["row"], "job").upper()
         if not n or (wanted and n not in wanted and n not in wanted_bases):
             continue
@@ -5342,6 +6104,14 @@ async def hcp_import_job_costs(
         lookup.setdefault(num, seg)
         return num
 
+    # Resolve every entry's job number once, so each section of the output
+    # names the same job for the same purchase.
+    for _b in ("job", "review"):
+        for e in buckets[_b]:
+            raw = _pick(e["row"], "job").upper()
+            e["job_no"] = (_resolve(raw, _norm_date(_pick(e["row"], "date")))
+                           if raw else raw)
+
     # ── net returns against purchases, per job + item ────────────────────────
     # Two passes over the job lines, because a credit has to land on the SAME
     # segment as the purchase it cancels. Purchases resolve on their own date;
@@ -5355,8 +6125,7 @@ async def hcp_import_job_costs(
         job_no = _pick(r, "job").upper()
         if wanted and job_no not in wanted and job_no not in wanted_bases:
             continue
-        rows_job.append((r, job_no, _norm_date(_pick(r, "date")),
-                         _money(_pick(r, "amount")),
+        rows_job.append((r, job_no, _norm_date(_pick(r, "date")), _amt(r),
                          _pick(r, "sku") or _pick(r, "desc").lower()))
 
     seg_of_item: dict[tuple, set] = {}
@@ -5384,22 +6153,91 @@ async def hcp_import_job_costs(
         key = (num, item)
         qty = _money(_pick(r, "qty")) or 1.0
         m = merged.setdefault(key, {
-            "job": num, "name": desc[:120], "sku": _pick(r, "sku"),
+            "job": num, "name": desc[:120], "sku": _pick(r, "sku"), "row": r,
             "amount": 0.0, "qty": 0.0, "dates": set(), "receipts": set(),
             "buyers": set(), "lines": 0, "bought": 0, "returned": 0,
             "from_base": job_no if num != job_no else "",
+            # purchases only, so a return cannot blend the unit price
+            "buy_amount": 0.0, "buy_qty": 0.0, "net_paid": 0.0,
+            "item": item, "moved_from": "", "move_why": "",
         })
         sign = -1 if amount < 0 else 1
         m["amount"] += amount
+        m["net_paid"] += _net(r)
         m["qty"] += qty * sign
         m["lines"] += 1
         m["returned" if amount < 0 else "bought"] += 1
+        if amount >= 0:
+            m["buy_amount"] += amount
+            m["buy_qty"] += qty
         if pdate:
             m["dates"].add(pdate)
         if rc := _pick(r, "receipt"):
             m["receipts"].add(rc)
         if b := _pick(r, "purchaser"):
             m["buyers"].add(b)
+
+    # ── a return written against the wrong job ───────────────────────────────
+    # Netting keys on (job, item), so a credit carrying the WRONG job number
+    # never meets the purchase it cancels: one job keeps cost it returned and
+    # the other gets a credit that lands nowhere. Real case — PEX fittings
+    # bought Aug 10 on #393, returned Aug 11 tagged #442, identical SKUs, so
+    # #393 was left carrying $57.38 it had sent back.
+    #
+    # The Order Reference path cannot catch this: Home Depot returns carry no
+    # order reference, and the job field IS filled in, just wrongly.
+    def _days_apart(a: set, b: set) -> Optional[int]:
+        best = None
+        for x in a:
+            for y in b:
+                try:
+                    d = abs((dt.strptime(x, "%Y-%m-%d")
+                             - dt.strptime(y, "%Y-%m-%d")).days)
+                except (ValueError, TypeError):
+                    continue
+                if best is None or d < best:
+                    best = d
+        return best
+
+    credit_moves: list[dict] = []
+    credit_puzzles: list[dict] = []
+    for key in [k for k, m in merged.items()
+                if round(m["amount"], 2) < 0 and m["bought"] == 0]:
+        cred = merged[key]
+        cands = []
+        for k2, m2 in merged.items():
+            if k2 == key or m2["item"] != cred["item"]:
+                continue
+            if round(m2["amount"], 2) <= 0 or m2["job"] == cred["job"]:
+                continue
+            d = _days_apart(cred["dates"], m2["dates"])
+            if d is not None and d <= trip_days:
+                cands.append((d, k2, m2))
+        if not cands:
+            continue
+        if len(cands) == 1:
+            _, _, tgt = cands[0]
+            credit_moves.append({
+                "from": cred["job"], "to": tgt["job"], "name": cred["name"],
+                "amount": abs(cred["amount"]),
+                "dates": sorted(cred["dates"] | tgt["dates"]),
+            })
+            tgt["amount"] += cred["amount"]
+            tgt["net_paid"] += cred["net_paid"]
+            tgt["qty"] += cred["qty"]
+            tgt["lines"] += cred["lines"]
+            tgt["returned"] += cred["returned"]
+            tgt["dates"] |= cred["dates"]
+            tgt["receipts"] |= cred["receipts"]
+            del merged[key]
+        else:
+            # More than one job bought the same thing that week, so which
+            # purchase this credit cancels is a real question. Left alone.
+            credit_puzzles.append({
+                "job": cred["job"], "name": cred["name"],
+                "amount": abs(cred["amount"]),
+                "options": [m2["job"] for _, _, m2 in sorted(cands)],
+            })
 
     postable = [m for m in merged.values() if round(m["amount"], 2) > 0]
     # A return that cancels a purchase in this same file is fine and needs no
@@ -5426,6 +6264,7 @@ async def hcp_import_job_costs(
     existing: dict[str, set] = {}
     charged: dict[str, float] = {}
     spent_already: dict[str, float] = {}
+    job_terms: dict[str, set] = {}
     for num, job in lookup.items():
         try:
             d = await api_request("GET", f"/jobs/{job['id']}/job_input_materials")
@@ -5442,6 +6281,14 @@ async def hcp_import_job_costs(
             items_j = []
         charged[num] = sum(int(i.get("amount") or 0) for i in items_j
                            if i.get("kind") == "materials") / 100
+        # The job's own words, for judging whether an item belongs on it. Every
+        # line item counts, not only the materials ones — LHSTL scopes list the
+        # consumables in the labor description as often as the materials one,
+        # and more vocabulary means fewer lines held for no reason.
+        job_terms[num] = _job_text(
+            job.get("description") or "", job.get("name") or "",
+            *[f"{i.get('name') or ''} {i.get('description') or ''}"
+              for i in items_j if isinstance(i, dict)])
         seen_keys = set()
         for m in mats:
             if not isinstance(m, dict):
@@ -5450,8 +6297,151 @@ async def hcp_import_job_costs(
             for rid in re.findall(r"receipt\s+(\S+)",
                                   str(m.get("description") or "")):
                 for one in rid.split(","):
-                    seen_keys.add((part, one.strip()))
+                    seen_keys.add((part, _rid(one)))
         existing[num] = seen_keys
+
+    async def _load_job(num: str, job: dict) -> None:
+        """Pull the same context for a job that was not on any receipt here."""
+        lookup.setdefault(num, job)
+        if num in existing:
+            return
+        try:
+            d = await api_request("GET", f"/jobs/{job['id']}/job_input_materials")
+            mats = d.get("job_input_materials") or d.get("data") or []
+        except Exception:
+            mats = []
+        spent_already[num] = sum(
+            float(m.get("unit_cost") or 0) * float(m.get("quantity") or 0)
+            for m in mats if isinstance(m, dict)) / 100
+        try:
+            li = await api_request("GET", f"/jobs/{job['id']}/line_items")
+            items_j = li.get("data") or li.get("line_items") or []
+        except Exception:
+            items_j = []
+        charged[num] = sum(int(i.get("amount") or 0) for i in items_j
+                           if i.get("kind") == "materials") / 100
+        job_terms[num] = _job_text(
+            job.get("description") or "", job.get("name") or "",
+            *[f"{i.get('name') or ''} {i.get('description') or ''}"
+              for i in items_j if isinstance(i, dict)])
+        keys = set()
+        for m in mats:
+            if not isinstance(m, dict):
+                continue
+            part = str(m.get("part_number") or "").strip()
+            for rid in re.findall(r"receipt\s+(\S+)",
+                                  str(m.get("description") or "")):
+                for one in rid.split(","):
+                    keys.add((part, _rid(one)))
+        existing[num] = keys
+
+    # ── does each item belong on the job it was tagged to? ───────────────────
+    # Held rather than posted, because posted materials cannot be deleted
+    # through the API — only zeroed. One look at a held list costs a minute; a
+    # wrong post is permanent cleanup.
+    #
+    # Three gates, so this does not cry wolf:
+    #   1. the job's quote has to be DESCRIPTIVE enough to have an opinion. A
+    #      job billing a generic "List of Materials" carries no signal, and a
+    #      check with no signal must not hold anything.
+    #   2. the job has to be heading PAST its materials allowance. An item that
+    #      reads oddly but fits the budget is far more likely a quote written
+    #      loosely than a mis-tagged PO.
+    #   3. universally-used consumables are never held — screws and caulk say
+    #      nothing about whether the receipt was tagged right.
+    held: dict[str, list[dict]] = {}
+    belongs_moves: list[dict] = []
+    belongs_notes: list[str] = []
+    suspects: list[tuple[str, dict]] = []
+    for num in list(by_job):
+        terms = job_terms.get(num) or set()
+        if num not in lookup or len(terms) < 6:
+            continue
+        bill = charged.get(num, 0.0)
+        prior = spent_already.get(num, 0.0)
+        jt = sum(m["amount"] for m in by_job[num])
+        if bill > 0 and prior + jt <= bill * overrun_factor:
+            continue
+        kin = _kin(terms)
+        for m in list(by_job[num]):
+            ok, _common = _fits(m["row"], terms, kin)
+            if ok:
+                continue
+            suspects.append((num, m))
+
+    if suspects:
+        # Candidate homes for a mis-tagged line: every job already in play,
+        # plus jobs scheduled around the purchase dates that were never on a
+        # receipt in this file. The door hardware's real job is usually the
+        # second kind — bought on the same trip, its own PO never written down.
+        cands: dict[str, dict] = dict(lookup)
+        all_dates = sorted({d for m in postable for d in m["dates"]})
+        if all_dates:
+            try:
+                lo = (dt.strptime(all_dates[0], "%Y-%m-%d")
+                      - timedelta(days=trip_days)).strftime("%Y-%m-%d")
+                hi = (dt.strptime(all_dates[-1], "%Y-%m-%d")
+                      + timedelta(days=trip_days)).strftime("%Y-%m-%d")
+                page = 1
+                while page <= 4:
+                    d = await api_request("GET", "/jobs", params={
+                        "scheduled_start_min": f"{lo}T00:00:00Z",
+                        "scheduled_start_max": f"{hi}T23:59:59Z",
+                        "page": page, "page_size": 100})
+                    for j in d.get("jobs", []):
+                        n = str(j.get("invoice_number") or "").strip().upper()
+                        if n:
+                            cands.setdefault(n, j)
+                    if page >= (d.get("total_pages") or 1):
+                        break
+                    page += 1
+            except Exception as e:
+                belongs_notes.append(
+                    f"could not look for same-trip jobs ({type(e).__name__}), so "
+                    f"held lines were not offered a new home")
+
+        # A job not in `lookup` has only its own name to go on, which is enough
+        # for "Front Door Hardware Swap" to answer for a deadbolt.
+        cand_terms = {n: (job_terms.get(n)
+                          or _job_text(j.get("description") or "",
+                                       j.get("name") or ""))
+                      for n, j in cands.items()}
+
+        for num, m in suspects:
+            item = _item_terms(m["row"])
+            fits_elsewhere = []
+            for n, t in cand_terms.items():
+                if n == num or n.split("-")[0] == num.split("-")[0]:
+                    continue
+                if _shared(item, t) or (_kin(item) & _kin(t)):
+                    fits_elsewhere.append(n)
+            # STRONG means one and only one other job in the window reads as a
+            # home for this item, and the job it was tagged to reads as none.
+            # Anything short of that is a question, not an answer, and money is
+            # not moved on a question.
+            if len(fits_elsewhere) == 1:
+                tgt = fits_elsewhere[0]
+                await _load_job(tgt, cands[tgt])
+                by_job[num].remove(m)
+                m["moved_from"], m["job"] = num, tgt
+                m["move_why"] = (cands[tgt].get("description") or "")[:38]
+                by_job.setdefault(tgt, []).append(m)
+                belongs_moves.append(m)
+            else:
+                m["fits"] = fits_elsewhere
+                by_job[num].remove(m)
+                held.setdefault(num, []).append(m)
+        by_job = {n: v for n, v in by_job.items() if v}
+
+        # allow_mismatch puts held lines back, for when the quote was simply
+        # written loosely and the tag was right all along.
+        if mismatch_ok:
+            for num in list(held):
+                if "ALL" in mismatch_ok or num in mismatch_ok \
+                        or num.split("-")[0] in mismatch_ok:
+                    by_job.setdefault(num, []).extend(held.pop(num))
+
+    unknown = sorted(set(by_job) - set(lookup))
 
     D = lambda v: f"${v:,.2f}"
     lines = [
@@ -5461,6 +6451,48 @@ async def hcp_import_job_costs(
         + (f"  |  limited to job(s) {', '.join(sorted(wanted))}" if wanted else ""),
         f"║  {'PREVIEW ONLY — nothing written' if dry_run else '⚠ POSTING TO JOBS'}",
     ]
+
+    # ── what each line is being valued at ────────────────────────────────────
+    # Home Depot bills at LIST and rebates the Pro Xtra discount separately, so
+    # saying which basis a run used is not a detail — it is a 15-18% difference
+    # in every margin figure downstream.
+    gross_all = sum(abs(_amt(r)) for r in rows)
+    net_all = sum(abs(_net(r)) for r in rows)
+    if abs(gross_all - net_all) > 0.01:
+        saved = gross_all - net_all
+        lines += [
+            f"╠══ AMOUNT BASIS: {basis} ═══════════════════════════════════════",
+            f"║  {('list price' if basis == 'retail' else 'net of discount'):<19}"
+            f"{D(gross_all if basis == 'retail' else net_all):>12}"
+            f"   ← what posts to jobs",
+            f"║  {'actually paid':<19}{D(net_all):>12}",
+            f"║  {'supplier discount':<19}{D(saved):>12}"
+            f"   ({saved / gross_all * 100:.1f}%)",
+            f"║  " + ("Posted at list, so the discount lands in gross margin."
+                      if basis == "retail" else
+                      "Posted net, so the discount does not show in margin."),
+        ]
+    else:
+        shown = sum(abs(_money(_first_col(r, (c,)))) for r in rows
+                    for c in (_amount_rule(vendor).get("report_discount") or ()))
+        if shown > 0.01:
+            lines += [
+                f"╠══ AMOUNT BASIS: as invoiced ══════════════════════════════════",
+                f"║  {D(gross_all)} posted. This supplier's totals already come",
+                f"║  net of its {D(shown)} discount, so that benefit is in the",
+                f"║  cost and reaches gross margin the same way.",
+            ]
+    if health.get("warnings") or health.get("fatal"):
+        lines.append(f"╠══ ⚠ ABOUT THIS FILE ═════════════════════════════════════════")
+        for w in health.get("fatal", []) + health["warnings"]:
+            lines.append(f"║  • {w}")
+    if health.get("repeat_rows"):
+        lines.append(f"╠══ REPEATED ROWS ═════════════════════════════════════════════")
+        lines.append(f"║  {health['repeat_rows']} row(s) in {health['repeat_groups']}"
+                     f" group(s) are byte-identical to another row —")
+        lines.append(f"║  same date, receipt, SKU, quantity and amount. They are")
+        lines.append(f"║  SUMMED, which is right if the register really rang the item")
+        lines.append(f"║  twice and wrong if the export duplicated it. Worth an eye.")
 
     total_post = 0.0
     lines.append(f"╠══ WILL POST TO JOBS ═════════════════════════════════════════")
@@ -5513,7 +6545,7 @@ async def hcp_import_job_costs(
     def _section(title: str, entries: list[dict], note: str = "") -> None:
         if not entries:
             return
-        tot = sum(abs(_money(_pick(e["row"], "amount"))) for e in entries)
+        tot = sum(abs(_amt(e["row"])) for e in entries)
         lines.append(f"╠══ {title} — {D(tot)} ═══════════════════════════")
         if note:
             lines.append(f"║  {note}")
@@ -5521,12 +6553,78 @@ async def hcp_import_job_costs(
         for e in entries:
             seen.setdefault(e["why"], []).append(e)
         for why, group in sorted(seen.items(), key=lambda kv: -len(kv[1])):
-            gt = sum(abs(_money(_pick(e["row"], "amount"))) for e in group)
+            gt = sum(abs(_amt(e["row"])) for e in group)
             lines.append(f"║  {len(group):>3} line(s)  {D(gt):>10}   {why}")
             for e in group[:4]:
                 lines.append(f"║        {_pick(e['row'], 'desc')[:56]}")
             if len(group) > 4:
                 lines.append(f"║        … and {len(group) - 4} more")
+
+    if belongs_moves:
+        mt = sum(m["amount"] for m in belongs_moves)
+        lines.append(f"╠══ MOVED TO A BETTER-FITTING JOB ({len(belongs_moves)}) — {D(mt)} ═══════")
+        lines.append(f"║  These read as part of another job bought around the same")
+        lines.append(f"║  date, and only one job in that window fits. Moved, and the")
+        lines.append(f"║  job they were tagged to fits none of them.")
+        for m in sorted(belongs_moves, key=lambda m: -m["amount"]):
+            lines.append(f"║      {D(m['amount']):>9}  {m['name'][:40]}")
+            lines.append(f"║                 #{m['moved_from']} → #{m['job']}"
+                         f"  {m['move_why']}")
+    if credit_moves:
+        ct = sum(m["amount"] for m in credit_moves)
+        lines.append(f"╠══ RETURNS MATCHED TO THEIR PURCHASE ({len(credit_moves)}) — {D(ct)} ═════")
+        lines.append(f"║  Credit written against one job, item bought on another. The")
+        lines.append(f"║  credit follows the purchase it cancels.")
+        for m in credit_moves:
+            lines.append(f"║      {D(m['amount']):>9}  {m['name'][:40]}")
+            lines.append(f"║                 credit #{m['from']} → #{m['to']}"
+                         f"  ({', '.join(m['dates'][:2])})")
+    if held:
+        ht = sum(m["amount"] for v in held.values() for m in v)
+        hn = sum(len(v) for v in held.values())
+        lines.append(f"╠══ DOES THIS BELONG? — {D(ht)} HELD, NOT POSTED ═══════════")
+        lines.append(f"║  Nothing in the job's own scope reads like these, and the job")
+        lines.append(f"║  is already heading past what it bills for materials. Held")
+        lines.append(f"║  because a posted material cannot be deleted, only zeroed.")
+        for num in sorted(held, key=lambda n: -sum(m["amount"] for m in held[n])):
+            job = lookup.get(num)
+            bill = charged.get(num, 0.0)
+            lines.append(f"║")
+            lines.append(f"║  #{num} — {(job.get('description') if job else '')[:34]}"
+                         f"   {D(sum(m['amount'] for m in held[num]))} held")
+            lines.append(f"║      bills {D(bill)} materials, {D(spent_already.get(num, 0.0))}"
+                         f" already on it")
+            # Trade words first — "ceiling, drywall, joint, compound" says what
+            # the job is; the alphabetical head of the list said "backing,
+            # beneath, blend".
+            known = set().union(*_KIN_GROUPS)
+            terms = sorted(job_terms.get(num) or set(),
+                           key=lambda w: (w not in known, w))[:9]
+            if terms:
+                lines.append(f"║      job asks for: {', '.join(terms)}")
+            for m in sorted(held[num], key=lambda m: -m["amount"]):
+                lines.append(f"║      ✗ {D(m['amount']):>9}  {m['name'][:42]}")
+                if _already_imported(m, existing.get(num, set())):
+                    # Not a decision to make — a mistake already on the job.
+                    # Materials cannot be deleted, so the fix is to zero it.
+                    lines.append(f"║          ⚠ ALREADY ON THIS JOB from an earlier import.")
+                    lines.append(f"║            Nothing to decide — zero this line out in HCP if")
+                    lines.append(f"║            it does not belong.")
+                if m.get("fits"):
+                    lines.append(f"║          could be #"
+                                 + ", #".join(m["fits"][:4])
+                                 + " — too many to choose")
+        lines.append(f"║")
+        fresh_held = [n for n, v in held.items()
+                      if any(not _already_imported(m, existing.get(n, set()))
+                             for m in v)]
+        lines.append(f"║  {hn} line(s) / {D(ht)} will NOT post.")
+        if fresh_held:
+            lines.append(f"║  If the tag was right and the quote was just written loosely,")
+            lines.append(f"║  re-run with allow_mismatch=\""
+                         + ",".join(sorted(fresh_held)) + "\".")
+    for note in belongs_notes:
+        lines.append(f"║  ⚠ {note}")
 
     _section("NOT A JOB COST (overhead)", buckets["general"],
              "Tools and van/shop stock. Book these to overhead, not to a job.")
@@ -5537,8 +6635,10 @@ async def hcp_import_job_costs(
     if buckets["review"]:
         rev_by_job: dict[str, list] = {}
         for e in buckets["review"]:
-            rev_by_job.setdefault(_pick(e["row"], "job").upper() or "—", []).append(e)
-        rev_total = sum(abs(_money(_pick(e["row"], "amount")))
+            rev_by_job.setdefault(
+                e.get("job_no") or _pick(e["row"], "job").upper() or "—",
+                []).append(e)
+        rev_total = sum(abs(_amt(e["row"]))
                         for e in buckets["review"])
         lines.append(f"╠══ NEEDS YOUR CALL — {D(rev_total)} ═══════════════════════════")
         lines.append(f"║  Job material or van restock? Shown against what each job bills")
@@ -5546,9 +6646,9 @@ async def hcp_import_job_costs(
         lines.append(f"║  Route them all with supplies='job' or supplies='general', or")
         lines.append(f"║  pin rules in config to stop being asked.")
         for jnum in sorted(rev_by_job, key=lambda n: -sum(
-                abs(_money(_pick(e["row"], "amount"))) for e in rev_by_job[n])):
+                abs(_amt(e["row"])) for e in rev_by_job[n])):
             group = rev_by_job[jnum]
-            gt = sum(abs(_money(_pick(e["row"], "amount"))) for e in group)
+            gt = sum(abs(_amt(e["row"])) for e in group)
             job = lookup.get(jnum)
             lines.append(f"║")
             if job:
@@ -5564,8 +6664,8 @@ async def hcp_import_job_costs(
                                  f"  ({prior / bill * 100:.0f}%)")
             else:
                 lines.append(f"║  #{jnum}   {D(gt)} undecided")
-            for e in sorted(group, key=lambda e: -abs(_money(_pick(e["row"], "amount"))))[:8]:
-                lines.append(f"║      {D(abs(_money(_pick(e['row'], 'amount')))):>9}"
+            for e in sorted(group, key=lambda e: -abs(_amt(e["row"])))[:8]:
+                lines.append(f"║      {D(abs(_amt(e['row']))):>9}"
                              f"  {_pick(e['row'], 'desc')[:46]}")
             if len(group) > 8:
                 lines.append(f"║      … and {len(group) - 8} more")
@@ -5585,6 +6685,16 @@ async def hcp_import_job_costs(
         lines.append(f"║  the cost — reduce it by hand. Not posted either way.")
         for m in orphan_returns:
             lines.append(f"║      #{m['job']}  {D(abs(m['amount'])):>9}  {m['name'][:44]}")
+
+    if credit_puzzles:
+        pt = sum(m["amount"] for m in credit_puzzles)
+        lines.append(f"╠══ ⚠ CREDITS THAT COULD BELONG TO SEVERAL JOBS ({len(credit_puzzles)}) ══")
+        lines.append(f"║  {D(pt)}. More than one job bought this item that week, so")
+        lines.append(f"║  which purchase the credit cancels is a real question. Left")
+        lines.append(f"║  alone — decide it and reduce that job by hand.")
+        for m in credit_puzzles:
+            lines.append(f"║      tagged #{m['job']}  {D(m['amount']):>9}  {m['name'][:36]}")
+            lines.append(f"║          also bought on #" + ", #".join(m["options"][:4]))
 
     if unknown:
         plain = [u for u in unknown if u not in segments]
@@ -5610,20 +6720,53 @@ async def hcp_import_job_costs(
             lines.append(f"║  edit the PO in the CSV to the segment you mean, then re-run.")
         lines.append(f"║  Nothing posted for these.")
 
+    # ── what is NOT going anywhere ───────────────────────────────────────────
+    # Stated as its own line rather than left implied by the sections above. A
+    # run with supplies='job' once left $195 of batteries and vac filters in
+    # review, unposted, while the summary said only "would post $X" — the money
+    # that went nowhere was invisible unless you counted the lists yourself.
+    left_review = sum(abs(_amt(e["row"])) for e in buckets["review"])
+    # Only money that could still go somewhere. A held line already on its job
+    # from an earlier run was never going to post, and counting it here would
+    # overstate what is genuinely undecided.
+    left_held = sum(m["amount"] for n, v in held.items() for m in v
+                    if not _already_imported(m, existing.get(n, set())))
+    left_unknown = sum(m["amount"] for n in unknown for m in by_job.get(n, []))
+    stranded = left_review + left_held + left_unknown
+    if stranded > 0.005:
+        lines.append(f"╠══ NOT POSTED ANYWHERE — {D(stranded)} ═══════════════════════")
+        if left_review:
+            lines.append(f"║  {len(buckets['review']):>3} line(s)  {D(left_review):>10}"
+                         f"   awaiting your call (supplies= / tools=)")
+        if left_held:
+            lines.append(f"║  {sum(len(v) for v in held.values()):>3} line(s)"
+                         f"  {D(left_held):>10}   held — does it belong on that job?")
+        if left_unknown:
+            lines.append(f"║  {sum(len(by_job.get(n, [])) for n in unknown):>3} line(s)"
+                         f"  {D(left_unknown):>10}   job number could not be resolved")
+        lines.append(f"║  This is neither a job cost nor overhead yet. It is money")
+        lines.append(f"║  with nowhere to go until you decide.")
+
     # ── post ─────────────────────────────────────────────────────────────────
     lines.append(f"╠══════════════════════════════════════════════════════════════")
     if dry_run:
-        oh = sum(abs(_money(_pick(e["row"], "amount")))
+        oh = sum(abs(_amt(e["row"]))
                  for e in buckets["general"] + buckets["skip"])
         if overhead_only:
             lines += [
                 f"║  overhead_only: would record {D(oh)} of non-job spend and post",
                 f"║  NOTHING to jobs. The {D(total_post)} of job materials stays put.",
             ]
+        elif total_post <= 0.005:
+            lines += [
+                f"║  Nothing new to post — every job line in this file is already",
+                f"║  on its job from an earlier import. {D(oh)} of non-job spend",
+                f"║  would be recorded in the overhead ledger.",
+            ]
         else:
             lines += [
                 f"║  Would post {D(total_post)} to "
-                f"{len([n for n in by_job if n in lookup])} job(s),",
+                f"{len([n for n, v in by_job.items() if n in lookup and any(not _already_imported(m, existing.get(n, set())) for m in v)])} job(s),",
                 f"║  and record {D(oh)} of non-job spend in the overhead ledger.",
             ]
         lines += [
@@ -5639,7 +6782,10 @@ async def hcp_import_job_costs(
     # Everything that is NOT going on a job still happened — record it before
     # posting, so the two halves of the receipt stay together.
     overhead_entries = buckets["general"] + buckets["skip"]
-    ledger_written, ledger_path = _append_overhead(vendor, overhead_entries)
+    ledger_written, ledger_path, ledger_notes = _append_overhead(
+        vendor, overhead_entries)
+    for note in ledger_notes:
+        lines.append(f"║  ℹ {note}")
 
     if overhead_only:
         lines.append(f"║  ✓ Recorded {ledger_written} non-job line(s) in")
@@ -5655,16 +6801,42 @@ async def hcp_import_job_costs(
         payload = []
         for m in by_job.get(num, []):
             marker = _receipt_marker(vendor, m)
+            if m.get("moved_from"):
+                marker += f" (tagged #{m['moved_from']}, moved here)"
             if _already_imported(m, existing.get(num, set())):
                 continue
             qty = round(m["qty"], 2) or 1.0
+            # ── keep the unit price honest ───────────────────────────────────
+            # Dividing the NET by the NET quantity produces a blended figure
+            # that reads as a real price and is not one: a deck board bought at
+            # $75.98 with one returned came out at $83.38/ea. HCP multiplies
+            # unit × quantity, so the line total was right and the price on the
+            # screen was wrong — the worse of the two failures, because a
+            # blended price is invisible.
+            #
+            # So post the price actually paid, at the quantity actually kept,
+            # and put any leftover difference on its own labelled line rather
+            # than hiding it in the unit cost.
+            unit = (m["buy_amount"] / m["buy_qty"]) if m.get("buy_qty") else 0.0
+            if unit <= 0:
+                unit = m["amount"] / qty if qty else 0.0
             payload.append({
                 "name": m["name"],
                 "description": marker,
                 "part_number": m["sku"],
                 "quantity": qty,
-                "unit_cost": int(round(m["amount"] / qty * 100)) if qty else 0,
+                "unit_cost": int(round(unit * 100)),
             })
+            residual = m["amount"] - unit * qty
+            if abs(residual) >= 0.50:
+                payload.append({
+                    "name": f"{m['name'][:96]} — return adjustment",
+                    "description": f"{marker} (credit at a different price than "
+                                   f"the purchase)",
+                    "part_number": m["sku"],
+                    "quantity": 1,
+                    "unit_cost": int(round(residual * 100)),
+                })
         if not payload:
             continue
         try:
@@ -5924,11 +7096,13 @@ async def hcp_overhead_report(
         group_by: category | purchaser | vendor | month
         compare_to_revenue: Show it as a share of job revenue in the same window
     """
+    _refresh_rules()
     path = _ledger_path()
     if not path.is_file():
         return (f"No overhead ledger yet at {path}.\n\n"
                 f"It is written the first time you run hcp_import_job_costs with "
                 f"dry_run=False — a preview does not record anything.")
+    schema_notes = _ensure_ledger_schema(path)
     try:
         with open(path, newline="", encoding="utf-8") as fh:
             rows = [r for r in csv.DictReader(fh)]
@@ -5960,9 +7134,17 @@ async def hcp_overhead_report(
         groups.setdefault(k, []).append(r)
 
     D = lambda v: f"${v:,.2f}"
+    net_total = sum(_money(r.get("net_paid")) for r in rows)
     lines = [
         f"╔══ NON-JOB SPEND — {span} ═════════════════════",
         f"║  {len(rows)} line(s)   {D(total)}   grouped by {key}",
+    ]
+    if net_total and abs(net_total - total) > 0.01:
+        lines.append(f"║  {D(net_total)} actually paid after supplier discounts"
+                     f"  ({(total - net_total) / total * 100:.1f}% off list)")
+    for note in schema_notes:
+        lines.append(f"║  ℹ {note}")
+    lines += [
         f"╠══════════════════════════════════════════════════════════════",
         f"║  {key.title():<26}{'lines':>7}{'amount':>13}{'share':>8}",
     ]
@@ -6004,8 +7186,35 @@ async def hcp_overhead_report(
                     lines.append(
                         f"║  nature, so judge it over quarters rather than weeks."
                     )
-        except Exception:
-            lines.append(f"║  (could not fetch revenue for comparison)")
+        except Exception as e:
+            # Say WHY. This printed a bare "(could not fetch revenue)" for a
+            # week, and the cause was un-normalised dates in the ledger making
+            # the window nonsense — invisible without the reason.
+            lines.append(f"║  ⚠ could not fetch revenue for comparison: "
+                         f"{type(e).__name__}: {str(e)[:90]}")
+            lines.append(f"║    window used: {dates[0]} → {dates[-1]}")
+
+    unlabelled = [r for r in rows
+                  if (r.get("category") or "").startswith("unassigned")]
+    if unlabelled:
+        ut = sum(amt(r) for r in unlabelled)
+        lines.append(f"╠══ NOBODY LABELLED THESE — {D(ut)} ═══════════════════════════")
+        lines.append(f"║  {len(unlabelled)} line(s) with no job and no VAN / RAFFLE / SHOP")
+        lines.append(f"║  label, so what they were for is unknown. Worth agreeing one")
+        lines.append(f"║  convention with the crew and using it every time.")
+        for r in sorted(unlabelled, key=amt, reverse=True)[:6]:
+            lines.append(f"║      {D(amt(r)):>9}  {(r.get('date') or '')[:10]}  "
+                         f"{(r.get('description') or '')[:32]:<34}"
+                         f"{(r.get('purchaser') or '')[:12]}")
+
+    mangled = sorted({r.get("receipt") for r in rows
+                      if _is_mangled_id(r.get("receipt"))})
+    if mangled:
+        lines.append(f"╠══ ⚠ UNRELIABLE RECEIPT IDS ══════════════════════════════════")
+        lines.append(f"║  {len(mangled)} receipt id(s) here are Excel scientific notation")
+        lines.append(f"║  ({', '.join(m for m in mangled[:3] if m)}). The real digits are")
+        lines.append(f"║  gone, so those lines cannot be deduplicated — re-importing")
+        lines.append(f"║  the same file would book them twice.")
 
     lines += [
         f"╠══════════════════════════════════════════════════════════════",
@@ -6148,6 +7357,36 @@ async def hcp_check_setup() -> str:
                       "hcp_get_pipeline_statuses and paste them in.")
     else:
         lines.append(f"║  ✓ {len(stages)} pipeline stages configured")
+
+    # ── 6. receipt-import rules ──────────────────────────────────────────────
+    # Named explicitly because these keys used to be documented and inert: the
+    # config file described ten of them and the code read four, so a rule you
+    # added failed silently and looked like it had worked.
+    R = _refresh_rules()
+    imp = R["cfg"]
+    if not imp:
+        lines.append("║  ℹ No job_cost_import section — receipt import runs on")
+        lines.append("║      built-in rules, which is fine to start with.")
+    else:
+        lines.append(f"║  ✓ Receipt import: {len(R['in_force'])} custom rule set(s) in force")
+        for k in R["in_force"]:
+            v = imp.get(k)
+            n = len(v) if isinstance(v, (list, dict)) else 1
+            lines.append(f"║      {k} ({n})")
+        unknown_keys = [k for k in imp
+                        if not k.startswith("_")
+                        and k not in {x for x, _ in _RULE_KEYS}
+                        and k not in ("tool_threshold_dollars", "ledger_path",
+                                      "amount_basis", "mismatch_overrun_factor",
+                                      "same_trip_days")]
+        if unknown_keys:
+            lines.append(f"║  ⚠ Not a setting this version reads: "
+                         + ", ".join(unknown_keys))
+            advice.append("Remove or correct the unrecognised job_cost_import "
+                          "keys — they do nothing.")
+    lines.append(f"║      tool threshold ${float(imp.get('tool_threshold_dollars', 150.0)):,.2f}"
+                 f"  |  amount basis: {imp.get('amount_basis', 'retail')}")
+    lines.append(f"║      ledger: {_ledger_path()}")
 
     # ── verdict ──────────────────────────────────────────────────────────────
     lines.append("╠══════════════════════════════════════════════════════════════")

@@ -158,20 +158,11 @@
     ]
   },
   "job_cost_import": {
-    "_comment": "Rules for hcp_import_job_costs, which posts supplier receipts onto jobs as material actuals. Defaults are in the code; anything set here overrides. The tool previews by default and never posts without dry_run=False \u2014 worth keeping that habit, because job input materials CANNOT be deleted through the API, only zeroed out.",
+    "_comment": "Rules for hcp_import_job_costs, which posts supplier receipts onto jobs as material actuals. Every list here EXTENDS the built-in defaults rather than replacing them, so you keep the rules that already work and add your own. Run hcp_check_setup to see which of these keys are actually in force. The tool previews by default and never posts without dry_run=False \u2014 worth keeping that habit, because job input materials CANNOT be deleted through the API, only zeroed out.",
     "tool_threshold_dollars": 150.0,
     "_tool_threshold_note": "At or above this, a tool purchase is treated as overhead rather than one job's cost. Below it, small tools are flagged for you to decide. A $219 rotary hammer charged to a job gets pulled out; a $27 drill bit does not.",
-    "non_job_labels": [
-      "",
-      "0",
-      "VAN",
-      "SHOP",
-      "STOCK",
-      "OFFICE",
-      "N/A",
-      "NONE"
-    ],
-    "_non_job_labels_note": "Values in the receipt's job column that mean 'not a job'. Van and shop stock land here. Add your own conventions.",
+    "non_job_labels": [],
+    "_non_job_labels_note": "EXTRA values in the receipt's job column that mean 'not a job'. VAN, SHOP, STOCK, TRUCK, RESTOCK, OFFICE, WAREHOUSE, RAFFLE, CHARITY, DONATION, MARKETING, N/A, NONE, 0 and blank are recognised already, and each is reported as its OWN ledger category \u2014 van restock, charity/raffle and shop stock are different kinds of spend that happen to share a field. Anything listed here is treated as unlabelled. An explicit label outranks what the item looks like: a drill in a RAFFLE basket is charity spend, not tooling. A blank or 0 is an absence rather than a statement, so there the item speaks \u2014 an unlabelled M18 kit is still reported as a tool.",
     "skip_subclasses": [
       "BEVERAGES",
       "SNACKS",
@@ -194,14 +185,16 @@
         "Project Name"
       ],
       "_job_note": "PO Number leads deliberately. Sherwin-Williams also has a 'Job Number' (always 1) and a 'Job Name' (always your own company) \u2014 both decoys. Home Depot has no PO column and its 'Job Name' really is the job.",
-      "amount": [
-        "Extended Retail (before discount)",
-        "Total Price",
-        "Line Total",
-        "Amount",
-        "Price"
-      ],
-      "_amount_note": "Must be the EXTENDED line total, never a unit price. Lowe's has both ('Item Price' unit, 'Total Price' extended). Sherwin-Williams calls its extended total plain 'Price' while still showing a Quantity \u2014 2 x $93.50 is a $93.50 line there, not $187."
+      "amount": [],
+      "_amount_note": "Must be the EXTENDED line total, never a unit price. Lowe's has both ('Item Price' unit, 'Total Price' extended). Sherwin-Williams calls its extended total plain 'Price' while still showing a Quantity \u2014 2 x $93.50 is a $93.50 line there, not $187. Note that Home Depot's 'Net Unit Price' is NOT a unit price despite the name: on a quantity-10 board line it reads $51.90, the line total, where the per-board price is $5.19. It is deliberately not listed as a unit column.",
+      "_ordering_note": "Aliases you add here are consulted BEFORE the built-in ones, because first match wins and naming a column is how you steer which one is read."
+    },
+    "amount_basis": "retail",
+    "_amount_basis_note": "'retail' posts Home Depot's list price to jobs and lets the Pro Xtra discount fall to gross margin \u2014 the customer was quoted against list, so that is the honest cost of the job and the discount is a margin gain. 'net' posts what the card was actually charged. Either way BOTH figures are reported in the preview and recorded in the ledger, so you can always see what the program is earning. On the September 2026 file that gap was $529 on $2,812, or 18.8%.",
+    "amount_rules": {
+      "_comment": "Which columns carry the gross amount and which carry discounts, per supplier. Matched loosely against the detected supplier name. Only needed for a supplier that bills at list and rebates separately.",
+      "_home_depot_note": "Built in: gross from 'Extended Retail (before discount)', less the absolute value of 'Program Discount Amount' and 'Other Discount Amount'. abs() on each because the two columns use OPPOSITE sign conventions and both mean 'reduction' \u2014 Pro Xtra volume discounts arrive negative, promotional ones positive.",
+      "_lowes_note": "Built in: nothing to compute. Lowe's Item Price is already post-discount and Total Price is the extended, tax-inclusive figure. Its 'Total Discount' column is reported for information only."
     },
     "always_general_keywords": [
       "glove",
@@ -240,6 +233,14 @@
       "ladder"
     ],
     "_equipment_note": "Things you own and keep using. Overhead at ANY price \u2014 the tool threshold does not apply, because a $70 floor fan is shop equipment for the same reason a $700 one is. This is about what the item IS, not what it cost.",
+    "van_stock_keywords": [],
+    "_van_stock_keywords_note": "Extra items that are always van restock. Gloves, trash bags, rags, towels, brooms, pencils, markers and caulk guns are built in.",
+    "ambiguous_keywords": [],
+    "_ambiguous_keywords_note": "Extra items you want ASKED about rather than guessed. Blades, drill bits, sandpaper, discs, tape, liners, brushes, rollers, shims, buckets, drop cloths and tarps are built in.",
+    "mismatch_overrun_factor": 1.25,
+    "_mismatch_note": "How far past its materials allowance a job has to be heading before the 'does this belong?' check will hold a line back. At 1.25 a job has to reach 125% of what it bills before an odd-looking item is held. Set it higher to be asked less often, lower to be asked more. The check also requires the job's quote to be DESCRIPTIVE \u2014 a job billing a generic 'List of Materials' carries no signal, so nothing is held there. Text after 'Exclusions', 'not included' or 'priced separately' is ignored, because a scope that names electrical only to exclude it should not accept a box of outlets.",
+    "same_trip_days": 7,
+    "_same_trip_note": "How many days either side to look for a better-fitting job when a line does not match the one it was tagged to, and for the purchase a mis-tagged return should cancel. A held line is MOVED automatically only when exactly one other job in that window fits it and the tagged job fits none \u2014 anything less clear-cut is listed for you and posts nowhere.",
     "_matching_note": "All keyword lists match WHOLE WORDS, not substrings. That is deliberate: 'brush' as a substring put a floor register 'in Brushed Nickel' into the review pile. Multi-word entries like 'drill bit' still work.",
     "_billing_context_note": "The preview shows each job's materials allowance from its line items next to what the import would spend. The allowances are generic ('List of Materials') so they cannot say whether a given blade belongs to a job, but they show whether a job can absorb the spend \u2014 and flag jobs billing NO materials, where every dollar posted comes off the margin.",
     "_overhead_ledger_note": "Lines the import decides are NOT job costs are appended to overhead_ledger.csv beside the server (override with the HCP_OVERHEAD_LEDGER environment variable). Read it with hcp_overhead_report. It is deliberately NOT a job in Housecall Pro: a dummy job shows up in every job list, drags portfolio margin because it is all cost and no revenue, needs a fake customer, and has to be excluded by hand from every report forever. It is also deliberately not a database \u2014 an append-only list of purchases is a CSV. This is for operational analysis; the expense itself belongs in your accounting software, which already receives these card transactions.",
