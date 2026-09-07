@@ -5052,12 +5052,50 @@ def _classify(row: dict, tool_threshold: float,
     amount = abs(_money(_pick(row, "amount")))
 
     haystack = " | ".join((dept, klass, sub))
-    if any(w in haystack for w in _SKIP_DEPT_WORDS):
-        return "skip", "fee or delivery line, not a material"
     if any(w in haystack for w in _SKIP_CATEGORY_WORDS):
         return "skip", "food or drink, not a job cost"
     if amount == 0:
         return "skip", "$0 line (bundle component or fee)"
+    # Delivery, freight and shipping are a real cost OF the job the material was
+    # delivered for, so a fee line FOLLOWS ITS JOB NUMBER rather than being
+    # dropped — Nikki's rule, Sep 6: "delivery fee on a job is applied to that
+    # job". Only a fee with no job on it has nowhere to land.
+    #
+    # This used to work by accident and only for Lowe's, which leaves its
+    # delivery lines uncategorised so they fell through to the job anyway. A
+    # supplier that files delivery under a FEES department had it dropped even
+    # with a job number on the receipt.
+    #
+    # Food and drink are the opposite case and are skipped above whatever the
+    # receipt says — a crew's energy drink is not a cost of the job it was
+    # charged to.
+    is_fee = any(w in haystack for w in _SKIP_DEPT_WORDS)
+
+    if job in _NON_JOB_LABELS:
+        label = job or "blank"
+        if is_fee:
+            return "skip", "fee or delivery line with no job on it"
+        return "general", f"no job on the receipt (job field = {label})"
+    # Some exports put an account or company name where the job should be
+    # (Sherwin-Williams fills "Job Name" with the company on every line). A job
+    # reference is a number here, so anything else means we do not know the job.
+    if not re.fullmatch(r"[0-9][0-9\-]*", job):
+        if is_fee:
+            return "skip", "fee or delivery line with no usable job on it"
+        return "general", f"no usable job reference on the receipt ({job[:24]})"
+
+    if is_fee:
+        return "job", ""
+
+    # Company-specific pins beat EVERY rule below, the tool classes included.
+    # This list is where you record a call you have already made and do not want
+    # asked about again, so it has to outrank the store's own categories — a
+    # shop vac pre-filter is filed under vacuums and read as a tool, but it is
+    # consumed on the job and Nikki had already said so. The pins sit under the
+    # job-number checks and not above them, because no pin can put a line on a
+    # job the receipt never named.
+    if _word_hit(low, always_job):
+        return "job", ""
 
     looks_tool = (klass in _TOOL_CLASSES or klass in _KEEP_TOOL_CLASSES
                   or _word_hit(low, _TOOL_WORDS))
@@ -5068,18 +5106,6 @@ def _classify(row: dict, tool_threshold: float,
             return "general", f"tool purchase ${amount:,.2f} — overhead, not one job"
         return "review", f"small tool ${amount:,.2f} — job cost or shop stock?"
 
-    if job in _NON_JOB_LABELS:
-        label = job or "blank"
-        return "general", f"no job on the receipt (job field = {label})"
-    # Some exports put an account or company name where the job should be
-    # (Sherwin-Williams fills "Job Name" with the company on every line). A job
-    # reference is a number here, so anything else means we do not know the job.
-    if not re.fullmatch(r"[0-9][0-9\-]*", job):
-        return "general", f"no usable job reference on the receipt ({job[:24]})"
-
-    # Company-specific pins beat everything below.
-    if _word_hit(low, always_job):
-        return "job", ""
     if _word_hit(low, always_general):
         return "general", "van stock (your rule)"
 
@@ -5189,7 +5215,10 @@ async def hcp_import_job_costs(
       • GENERAL  — overhead, not one job's cost: tool purchases at or above
                    tool_threshold, and anything bought to van/shop stock or
                    with no job on the receipt. Reported, never posted.
-      • SKIPPED  — food and drink, $0 bundle components, delivery fees.
+      • SKIPPED  — food and drink, $0 bundle components, and delivery or
+                   freight charges carrying no job number. A delivery fee WITH
+                   a job on it is posted to that job, because that is what it
+                   cost to get that job its material.
       • REVIEW   — consumables that could be either: blades, drill bits,
                    sandpaper, tape, brushes, buckets. The same drill bit is a
                    job material when it was bought for that job and van stock
