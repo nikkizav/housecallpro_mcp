@@ -7071,6 +7071,435 @@ async def hcp_job_financials(
     return "\n".join(lines)
 
 
+# ── Correcting material already posted to a job ───────────────────────────────
+#
+# The importer can only net a return against its purchase when BOTH are in the
+# same export. A credit arriving in a later file gets detected and reported and
+# then has nowhere to go, because a posted material cannot be deleted.
+#
+# It CAN be edited, though. The API's bulk_update treats a payload entry with a
+# uuid as an edit to that line and one without a uuid as a new line — so the
+# same endpoint that appends is also the one that corrects. That covers four
+# separate problems with one mechanism: applying a late return, taking material
+# off the job it was wrongly tagged to, repricing a line posted on the wrong
+# basis, and voiding a mistake.
+#
+# The danger is that materials have NO history. Once a quantity is reduced the
+# previous value is gone and the API keeps no record of it, so a wrong
+# correction would be both unrecoverable and invisible — worse than the wrong
+# posting it was meant to fix. Every change therefore writes what it did into
+# the line's own description AND into a log beside the overhead ledger.
+
+_ADJ_COLUMNS = ("adjusted_at", "job", "uuid", "part_number", "name", "action",
+                "old_quantity", "new_quantity", "old_unit_cost", "new_unit_cost",
+                "old_extended", "new_extended", "delta", "reason")
+
+
+def _adj_log_path() -> Path:
+    """Beside the overhead ledger, so the whole money trail lives together."""
+    return _ledger_path().parent / "material_adjustments.csv"
+
+
+def _log_adjustments(rows: list[dict]) -> tuple[int, Path]:
+    path = _adj_log_path()
+    if not rows:
+        return 0, path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not path.is_file()
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(_ADJ_COLUMNS),
+                           extrasaction="ignore")
+        if is_new:
+            w.writeheader()
+        w.writerows(rows)
+    return len(rows), path
+
+
+def _mat_qty(m: dict) -> float:
+    return float(m.get("quantity") or 0)
+
+
+def _mat_unit(m: dict) -> float:
+    """Unit cost in DOLLARS. The API stores cents."""
+    return float(m.get("unit_cost") or 0) / 100
+
+
+def _mat_ext(m: dict) -> float:
+    return _mat_unit(m) * _mat_qty(m)
+
+
+def _adj_note(old_q: float, new_q: float, old_u: float, new_u: float,
+              reason: str) -> str:
+    """The audit trail that travels with the record itself."""
+    bits = []
+    if abs(old_q - new_q) > 1e-9:
+        bits.append(f"qty {old_q:g}→{new_q:g}")
+    if abs(old_u - new_u) > 0.005:
+        bits.append(f"unit ${old_u:,.2f}→${new_u:,.2f}")
+    what = ", ".join(bits) or "no change"
+    return f" | adj {date.today().isoformat()}: {what} — {reason}"
+
+
+async def _jobs_for_adjust(client: httpx.AsyncClient, numbers: set,
+                           search_days: int) -> tuple[dict, list[str]]:
+    """(invoice_number -> job, notes). Either named jobs, or a recent window."""
+    found: dict[str, dict] = {}
+    notes: list[str] = []
+    if numbers:
+        page = 1
+        while page <= 12:
+            data, err = await _get_json(client, "/jobs", params={
+                "page": page, "page_size": 100,
+                "sort_by": "created_at", "sort_direction": "desc"})
+            if err:
+                notes.append(f"job list page {page} failed ({err})")
+                break
+            for j in data.get("jobs", []):
+                num = str(j.get("invoice_number") or "").strip().upper()
+                if num in numbers:
+                    found.setdefault(num, j)
+            if len(found) >= len(numbers) or page >= (data.get("total_pages") or 1):
+                break
+            page += 1
+        for miss in sorted(numbers - set(found)):
+            notes.append(f"#{miss} not found in Housecall Pro")
+        return found, notes
+
+    lo = (dt.now() - timedelta(days=search_days)).strftime("%Y-%m-%d")
+    hi = (dt.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    page = 1
+    while page <= 12:
+        data, err = await _get_json(client, "/jobs", params={
+            "scheduled_start_min": f"{lo}T00:00:00Z",
+            "scheduled_start_max": f"{hi}T23:59:59Z",
+            "page": page, "page_size": 100})
+        if err:
+            # Never treat a failed page as "no jobs" — that is how a throttled
+            # run quietly reports nothing found and looks like a clean result.
+            notes.append(f"job search page {page} failed ({err}) — "
+                         f"results below are INCOMPLETE")
+            break
+        for j in data.get("jobs", []):
+            num = str(j.get("invoice_number") or "").strip().upper()
+            if num:
+                found.setdefault(num, j)
+        if page >= (data.get("total_pages") or 1):
+            break
+        page += 1
+    return found, notes
+
+
+@mcp.tool()
+async def hcp_adjust_job_materials(
+    part_number: Optional[str] = None,
+    name_contains: Optional[str] = None,
+    job_numbers: Optional[str] = None,
+    action: Optional[str] = "reduce",
+    quantity: Optional[float] = None,
+    amount: Optional[float] = None,
+    unit_cost: Optional[float] = None,
+    reason: Optional[str] = None,
+    dry_run: Optional[bool] = True,
+    search_days: Optional[int] = 90,
+    skip_closed: Optional[bool] = False,
+) -> str:
+    """
+    Correct material already posted to a job — apply a late return, take a
+    wrongly-tagged item off a job, reprice a line, or void a mistake.
+
+    PREVIEWS BY DEFAULT. Nothing changes until you re-run with dry_run=False.
+
+    Posted materials cannot be DELETED through the API, only edited, so this
+    reduces or zeroes a line rather than removing it. Read that as permanent:
+    Housecall Pro keeps no history on materials, so once a quantity is changed
+    the old value is gone. Every change is therefore written into the line's own
+    description and logged to material_adjustments.csv beside your overhead
+    ledger, which is the only record that will exist.
+
+    The main use is the return the importer could not apply. hcp_import_job_costs
+    nets a credit against its purchase only when both are in the same export; a
+    return that arrives in a LATER file is reported as "returns with no matching
+    purchase" and left alone. Bring the part number here to finish the job.
+
+    What each action does:
+      • reduce  — take quantity= units, or amount= dollars, off the line. For a
+                  return: the unit price stays, the quantity drops.
+      • zero    — set the line to $0.00 and mark it void. For material that
+                  belongs to a different job, or an outright mistake. The line
+                  stays visible because it cannot be removed.
+      • reprice — change unit_cost, keeping the quantity. For a line posted on
+                  the wrong basis, such as list where net was meant.
+
+    Finding the line: give part_number (the supplier SKU, which the importer
+    writes onto every line it posts) and/or name_contains. Without job_numbers
+    it searches jobs scheduled in the last search_days, because a mis-tagged
+    receipt is usually near in time, not near in job number.
+
+    'reduce' refuses to act on more than one match — if two jobs bought the same
+    SKU, which one took the return is a question, not something to guess at.
+    Narrow it with job_numbers. 'zero' and 'reprice' will act on everything the
+    preview listed.
+
+    Most jobs you correct will be COMPLETE — that is the normal case for this
+    tool, not a warning sign, so closed jobs are included by default and simply
+    flagged. Do read the flag: reducing cost on finished work moves margin you
+    have already reported. skip_closed=True leaves them alone.
+
+    Args:
+        part_number: Supplier SKU to find, as written on the receipt
+        name_contains: Match on the material name instead of, or as well as, the SKU
+        job_numbers: Comma-separated job numbers to limit the search to
+        action: 'reduce' (default), 'zero' or 'reprice'
+        quantity: For 'reduce', how many units to take off
+        amount: For 'reduce', how many dollars to take off (instead of quantity)
+        unit_cost: For 'reprice', the new per-unit cost in dollars
+        reason: Why — required for a real run, and recorded on the line
+        dry_run: True (default) previews. False applies the change.
+        search_days: How far back to look when job_numbers is not given
+        skip_closed: Leave complete and canceled jobs untouched (default False —
+                     correcting finished work is the normal case here)
+    """
+    act = (action or "reduce").strip().lower()
+    if act not in ("reduce", "zero", "reprice"):
+        return "action must be 'reduce', 'zero' or 'reprice'."
+    if not (part_number or "").strip() and not (name_contains or "").strip():
+        return ("Give a part_number (the supplier SKU) or name_contains so the "
+                "line can be found.")
+    if act == "reduce" and quantity is None and amount is None:
+        return "For action='reduce', give quantity= (units) or amount= (dollars)."
+    if act == "reprice" and unit_cost is None:
+        return "For action='reprice', give unit_cost= as the new per-unit price."
+    if not dry_run and not (reason or "").strip():
+        return ("A reason is required for a real run — it is written onto the "
+                "line and into the adjustment log, and it is the only record "
+                "that will exist. Housecall Pro keeps no material history.")
+
+    pn = (part_number or "").strip()
+    frag = (name_contains or "").strip().lower()
+    wanted = {j.strip().upper() for j in (job_numbers or "").split(",") if j.strip()}
+
+    D = lambda v: f"${v:,.2f}"
+    notes: list[str] = []
+    matches: list[dict] = []
+    async with _hcp_client() as client:
+        jobs, jnotes = await _jobs_for_adjust(client, wanted, int(search_days or 90))
+        notes += jnotes
+        if not jobs:
+            return ("No jobs to search.\n" + "\n".join(f"  • {n}" for n in notes)
+                    if notes else "No jobs found in that window.")
+        ordered = list(jobs.items())
+        results = await _fanout_jobs(client, [j for _, j in ordered],
+                                     ["/job_input_materials"])
+        for (num, job), (res,) in zip(ordered, results):
+            payload, err = res
+            if err:
+                # A failed fetch is NOT "this job has no matching material".
+                notes.append(f"#{num}: could not read materials ({err}) — "
+                             f"any match on this job was missed")
+                continue
+            for m in (payload.get("job_input_materials") or []):
+                if not isinstance(m, dict):
+                    continue
+                if pn and str(m.get("part_number") or "").strip() != pn:
+                    continue
+                if frag and frag not in str(m.get("name") or "").lower():
+                    continue
+                if not m.get("uuid"):
+                    notes.append(f"#{num}: '{str(m.get('name'))[:30]}' has no uuid "
+                                 f"and cannot be edited")
+                    continue
+                matches.append({"num": num, "job": job, "m": m})
+
+    lines = [
+        f"╔══ ADJUST POSTED MATERIAL ════════════════════════════════════",
+        f"║  looking for "
+        + (f"SKU {pn}" if pn else "")
+        + ("  " if pn and frag else "")
+        + (f"name containing {name_contains!r}" if frag else ""),
+        f"║  across " + (f"job(s) {', '.join(sorted(wanted))}" if wanted
+                          else f"jobs scheduled in the last {int(search_days or 90)} days"),
+        f"║  action: {act}"
+        + (f"   {'PREVIEW ONLY' if dry_run else '⚠ WRITING'}"),
+    ]
+    for n in notes:
+        lines.append(f"║  ⚠ {n}")
+
+    if not matches:
+        lines += [
+            f"╠══════════════════════════════════════════════════════════════",
+            f"║  Nothing matched.",
+            f"║",
+            f"║  If this was a return, that usually means the original purchase",
+            f"║  was never posted to a job — so no job is carrying the cost and",
+            f"║  there is nothing to reduce. Worth confirming before assuming a",
+            f"║  job is overstated.",
+            f"║  Otherwise widen search_days, or drop part_number and search on",
+            f"║  name_contains instead.",
+            f"╚{'═' * 61}",
+        ]
+        return "\n".join(lines)
+
+    # ── work out the change, and whether each line may be touched ────────────
+    plan: list[dict] = []
+    for hit in matches:
+        m, num, job = hit["m"], hit["num"], hit["job"]
+        old_q, old_u = _mat_qty(m), _mat_unit(m)
+        new_q, new_u = old_q, old_u
+        if act == "reduce":
+            drop = (float(quantity) if quantity is not None
+                    else (float(amount) / old_u if old_u else 0.0))
+            new_q = round(max(old_q - drop, 0.0), 4)
+        elif act == "zero":
+            new_q, new_u = old_q, 0.0
+        else:
+            new_u = float(unit_cost)
+        closed = _norm_status(str(job.get("work_status") or "")).startswith(
+            ("complete", "canceled", "user_canceled", "pro_canceled"))
+        plan.append({**hit, "old_q": old_q, "old_u": old_u,
+                     "new_q": new_q, "new_u": new_u, "closed": closed,
+                     "old_ext": old_u * old_q, "new_ext": new_u * new_q})
+
+    # Newest job first, so the line you are most likely to mean is at the top.
+    plan.sort(key=lambda p: p["num"], reverse=True)
+    actionable = [p for p in plan if not (skip_closed and p["closed"])]
+
+    # ── the ambiguity guard counts EVERY match, not just the actionable ones ──
+    # Otherwise a filter that narrows 15 matches down to 1 quietly satisfies the
+    # check, and the tool picks a job on the strength of a filter rather than on
+    # evidence that it is the right one.
+    if act == "reduce" and len(plan) > 1:
+        lines.append(f"╠══ {len(plan)} LINES MATCH — TOO MANY TO ACT ON ═══════════════")
+        for p in plan[:10]:
+            lines.append(f"║  #{p['num']:<8}{p['old_q']:g} × {D(p['old_u']):>9}"
+                         f" = {D(p['old_ext']):>10}  "
+                         f"{(p['job'].get('description') or '')[:24]}"
+                         + ("  [closed]" if p["closed"] else ""))
+        if len(plan) > 10:
+            lines.append(f"║  … and {len(plan) - 10} more")
+        lines += [
+            f"║",
+            f"║  ⛔ A return came off ONE of these. Which job sent the material",
+            f"║  back is a question, not something to guess — nothing changed.",
+            f"║",
+            f"║  Pick it from the receipt and narrow with job_numbers=\"…\", or",
+            f"║  use name_contains= if the SKU is a generic item several jobs buy.",
+            f"╚{'═' * 61}",
+        ]
+        return "\n".join(lines)
+
+    lines.append(f"╠══ MATCHED {len(plan)} LINE(S) ═══════════════════════════════════")
+    shown = 0
+    for p in plan:
+        if shown >= 8:
+            lines.append(f"║")
+            lines.append(f"║  … and {len(plan) - shown} more not shown")
+            break
+        shown += 1
+        m = p["m"]
+        lines.append(f"║")
+        lines.append(f"║  #{p['num']} — {(p['job'].get('description') or '')[:36]}"
+                     + ("   [closed]" if p["closed"] else ""))
+        lines.append(f"║     {str(m.get('name'))[:52]}")
+        lines.append(f"║     SKU {str(m.get('part_number') or '—'):<12}"
+                     f"now {p['old_q']:g} × {D(p['old_u'])} = {D(p['old_ext'])}")
+        lines.append(f"║     {'':<16}→ {p['new_q']:g} × {D(p['new_u'])}"
+                     f" = {D(p['new_ext'])}"
+                     f"   ({D(p['new_ext'] - p['old_ext'])})")
+        if p["closed"] and skip_closed:
+            lines.append(f"║     ⛔ skipped — skip_closed is set")
+
+    delta = sum(p["new_ext"] - p["old_ext"] for p in actionable)
+    n_closed = sum(1 for p in actionable if p["closed"])
+    if n_closed:
+        lines.append(f"║")
+        lines.append(f"║  ⚠ {n_closed} of these {'is' if n_closed == 1 else 'are'} on a"
+                     f" completed or canceled job. That is normal for a")
+        lines.append(f"║    correction, but the cost change moves margin you have")
+        lines.append(f"║    already reported. skip_closed=True leaves them alone.")
+
+    lines.append(f"╠══════════════════════════════════════════════════════════════")
+    if not actionable:
+        lines += [
+            f"║  Nothing to change — every match is on a closed job.",
+            f"╚{'═' * 61}",
+        ]
+        return "\n".join(lines)
+
+    if dry_run:
+        lines += [
+            f"║  Would change {len(actionable)} line(s), moving job cost by {D(delta)}.",
+            f"║",
+            f"║  This CANNOT be undone. Housecall Pro keeps no history on",
+            f"║  materials, so the current values disappear when this runs —",
+            f"║  what is written to the line and to the adjustment log is the",
+            f"║  only record that will exist. Check the numbers above.",
+            f"║",
+            f"║  To apply, run again with dry_run=False and a reason.",
+            f"╚{'═' * 61}",
+        ]
+        return "\n".join(lines)
+
+    # ── apply, one job at a time ─────────────────────────────────────────────
+    by_job: dict[str, list[dict]] = {}
+    for p in actionable:
+        by_job.setdefault(p["num"], []).append(p)
+
+    changed, failed, log_rows = 0, [], []
+    for num, group in by_job.items():
+        job = group[0]["job"]
+        payload = []
+        for p in group:
+            m = p["m"]
+            note = _adj_note(p["old_q"], p["new_q"], p["old_u"], p["new_u"],
+                             (reason or "").strip())
+            desc = (str(m.get("description") or "") + note)[:480]
+            name = str(m.get("name") or "")
+            if p["new_u"] == 0 and act == "zero" and "void" not in name.lower():
+                name = f"{name[:96]} (void)"
+            # Send the whole record, changing only what was asked for. A partial
+            # payload risks the omitted fields being taken as blank.
+            payload.append({
+                "uuid": m["uuid"],
+                "name": name,
+                "description": desc,
+                "part_number": str(m.get("part_number") or ""),
+                "quantity": p["new_q"],
+                "unit_cost": int(round(p["new_u"] * 100)),
+            })
+        try:
+            await api_request(
+                "PUT", f"/jobs/{job['id']}/job_input_materials/bulk_update",
+                json={"job_input_materials": payload})
+            changed += len(payload)
+            for p in group:
+                log_rows.append({
+                    "adjusted_at": dt.now().isoformat(timespec="seconds"),
+                    "job": num, "uuid": p["m"]["uuid"],
+                    "part_number": str(p["m"].get("part_number") or ""),
+                    "name": str(p["m"].get("name") or "")[:80],
+                    "action": act,
+                    "old_quantity": f"{p['old_q']:g}", "new_quantity": f"{p['new_q']:g}",
+                    "old_unit_cost": f"{p['old_u']:.2f}", "new_unit_cost": f"{p['new_u']:.2f}",
+                    "old_extended": f"{p['old_ext']:.2f}", "new_extended": f"{p['new_ext']:.2f}",
+                    "delta": f"{p['new_ext'] - p['old_ext']:.2f}",
+                    "reason": (reason or "").strip()[:200],
+                })
+        except Exception as e:
+            failed.append((num, type(e).__name__))
+
+    written, log_path = _log_adjustments(log_rows)
+    lines.append(f"║  ✓ Changed {changed} line(s), moving job cost by {D(delta)}.")
+    if written:
+        lines.append(f"║  ✓ Recorded {written} adjustment(s) in")
+        lines.append(f"║    {log_path}")
+    if failed:
+        lines.append(f"║  ✗ Failed on {len(failed)} job(s): "
+                     + ", ".join(f"#{n} ({e})" for n, e in failed))
+    lines.append(f"║  Confirm with hcp_post_job_analysis on the affected job(s).")
+    lines.append(f"╚{'═' * 61}")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def hcp_overhead_report(
     start_date: Optional[str] = None,

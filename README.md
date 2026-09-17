@@ -730,8 +730,33 @@ Added or lost a tech? Re-run the setup wizard, then `hcp_check_setup`.
 
 Everything below is optional.
 
-**Architecture.** One server, `housecallpro_LHSTL.py`, with 58 tools returning
+**Architecture.** One server, `housecallpro_LHSTL.py`, with 59 tools returning
 formatted, readable output. There is nothing else to register.
+
+**Pulling data out for your own analysis.** `export.py` writes a date range of
+jobs to JSON and CSV — one row per job with the money and the time already
+worked out, so you start from figures rather than API payloads:
+
+```bash
+uv run python export.py --start 2026-01-01 --end 2026-09-14 --out ytd
+```
+
+It needs the API key available to the shell, which the MCP server does not: the
+server gets its key from the Claude Desktop config. Copy `.env.example` to
+`.env` and put your key in it. `.env` is gitignored — never commit or share it.
+
+Use this rather than writing your own pull loop. Housecall Pro rate-limits
+fan-out, and the obvious `asyncio.gather(..., return_exceptions=True)` turns
+every throttled response into an empty payload — which does not look like an
+error, it looks like a job with no appointments. That exact bug once corrupted
+139 of 295 jobs here and produced two confident, entirely false findings.
+`export.py` reuses the server's rate gate, retries the stragglers more slowly,
+and **names any job it could not read** instead of handing it back as zeroes.
+If it says every job fetched cleanly, the totals are complete.
+
+Judge quote accuracy from the `measured` rows only. On `estimated` rows the
+actual is derived from the schedule, so comparing the two measures how much
+calendar you blocked, not how long the work took.
 
 Earlier versions shipped 20 additional per-domain servers returning raw JSON.
 They were removed: most duplicated the main server, a number called endpoints that
