@@ -222,10 +222,11 @@ async def run(start: str, end: str, out: str, quiet: bool) -> int:
         "jobs": rows,
     }
     stem.with_suffix(".json").write_text(json.dumps(payload, indent=2))
-    with open(stem.with_suffix(".csv"), "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+    if rows:
+        with open(stem.with_suffix(".csv"), "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
 
     print(f"\n{len(rows)} jobs → {stem.with_suffix('.json')} and "
           f"{stem.with_suffix('.csv')}")

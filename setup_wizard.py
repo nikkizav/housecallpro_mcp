@@ -230,7 +230,8 @@ def choose_field_techs(employees: list[dict]) -> list[dict]:
     return team
 
 
-def build_config(found: dict, team: list[dict], sched: dict, tz: str) -> dict:
+def build_config(found: dict, team: list[dict], sched: dict, tz: str,
+                 prior: dict | None = None) -> dict:
     stages = []
     for i, s in enumerate(found["stages"], 1):
         stages.append({
@@ -241,7 +242,8 @@ def build_config(found: dict, team: list[dict], sched: dict, tz: str) -> dict:
             "used_for": ["job"],
             "notes": "",
         })
-    return {
+    prior = prior if isinstance(prior, dict) else {}
+    cfg = {
         "_version": VERSION,
         "_version_note": ("The release this config was built by. hcp_check_setup "
                           "compares it with the running code and tells you when to "
@@ -274,6 +276,10 @@ def build_config(found: dict, team: list[dict], sched: dict, tz: str) -> dict:
             "auth_header": "Authorization: Token {API_KEY}",
         },
     }
+    for carried_key in ("job_cost_import", "tags"):
+        if carried_key in prior:
+            cfg[carried_key] = prior[carried_key]
+    return cfg
 
 
 def uv_command() -> str:
@@ -386,13 +392,17 @@ def install_into_claude(cfg_dir: Path, api_key: str) -> tuple[bool, str]:
     # that no longer exist — Claude reports an error for each on every start.
     # Clear out anything aimed at this project folder whose target is missing.
     here = str(HERE.resolve())
+
+    def _in_here(a: str) -> bool:
+        return a == here or a.startswith(here + os.sep)
+
     stale = []
     for name, entry in list(servers.items()):
         if name == "housecallpro" or not isinstance(entry, dict):
             continue
         args = [str(a) for a in (entry.get("args") or [])]
         targets = [a for a in args if a.endswith(".py")]
-        if not any(here in a for a in args + targets):
+        if not any(_in_here(a) for a in args + targets):
             continue
         if targets and not any(Path(t).is_file() for t in targets):
             stale.append(name)
@@ -530,7 +540,7 @@ async def main() -> int:
     }
     tz = ask("Timezone", prior.get("company", {}).get("timezone") or "America/Chicago")
 
-    cfg = build_config(found, team, sched, tz)
+    cfg = build_config(found, team, sched, tz, prior)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
     field = [m for m in team if m.get("field_tech")]

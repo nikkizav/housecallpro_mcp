@@ -3760,7 +3760,7 @@ async def hcp_post_job_analysis(job_id: str) -> str:
             ipaid = sum(int(p.get("amount") or 0) for p in (i.get("payments") or [])
                         if isinstance(p, dict) and p.get("status") == "succeeded")
             lines.append(
-                f"║    #{str(i.get('invoice_number','?')):<6} {i.get('status','?'):<10}"
+                f"║    #{str(i.get('invoice_number','?')):<6} {(i.get('status') or '?'):<10}"
                 f" billed {_dollars(i.get('amount')):>10}"
                 f"  paid {_dollars(ipaid):>10}"
                 f"  due {_dollars(i.get('due_amount')):>10}"
@@ -4860,13 +4860,14 @@ def _ledger_existing_keys(path: Path) -> set:
     if not path.is_file():
         return set()
     keys = set()
-    try:
-        with open(path, newline="", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                keys.add((row.get("vendor", ""), _rid(row.get("receipt")),
-                          row.get("sku", ""), row.get("description", "")))
-    except Exception:
-        pass
+    # A failed read must not be mistaken for an empty ledger — that would make
+    # every existing entry look fresh and re-append it. Let it raise instead of
+    # silently returning a partial/empty set (the pattern that once turned rate
+    # limits into fabricated "0 hours" data — see hcp_time_variance's history).
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            keys.add((row.get("vendor", ""), _rid(row.get("receipt")),
+                      row.get("sku", ""), row.get("description", "")))
     return keys
 
 
@@ -5058,10 +5059,13 @@ def _merge_words(cfg: dict, key: str, builtin: tuple) -> tuple:
     out = list(builtin)
     have = {str(w).strip().lower() for w in out}
     for w in extra:
-        w = str(w).strip()
-        if w and w.lower() not in have:
+        # Stored lowercase: _word_hit matches case-sensitively against an
+        # already-lowercased description, so a config word with any uppercase
+        # letter (e.g. "Pressure Washer") would otherwise never match.
+        w = str(w).strip().lower()
+        if w and w not in have:
             out.append(w)
-            have.add(w.lower())
+            have.add(w)
     return tuple(out)
 
 
@@ -6359,7 +6363,12 @@ async def hcp_import_job_costs(
             continue
         bill = charged.get(num, 0.0)
         prior = spent_already.get(num, 0.0)
-        jt = sum(m["amount"] for m in by_job[num])
+        # Lines already posted (per `existing`) are already inside `prior` via
+        # the API — counting them again in `jt` double-charges them against the
+        # allowance and can trip the overrun gate on a re-imported statement
+        # that only contains previously-posted lines plus genuinely new ones.
+        jt = sum(m["amount"] for m in by_job[num]
+                 if not _already_imported(m, existing.get(num, set())))
         if bill > 0 and prior + jt <= bill * overrun_factor:
             continue
         kin = _kin(terms)
@@ -6805,7 +6814,9 @@ async def hcp_import_job_costs(
                 marker += f" (tagged #{m['moved_from']}, moved here)"
             if _already_imported(m, existing.get(num, set())):
                 continue
-            qty = round(m["qty"], 2) or 1.0
+            # A net quantity of exactly 0 is real (everything bought was also
+            # returned) — it must not be coerced into a fake "1 unit kept".
+            qty = round(m["qty"], 2)
             # ── keep the unit price honest ───────────────────────────────────
             # Dividing the NET by the NET quantity produces a blended figure
             # that reads as a real price and is not one: a deck board bought at
@@ -6816,17 +6827,19 @@ async def hcp_import_job_costs(
             #
             # So post the price actually paid, at the quantity actually kept,
             # and put any leftover difference on its own labelled line rather
-            # than hiding it in the unit cost.
+            # than hiding it in the unit cost. Nothing kept (qty 0) means no
+            # item line at all — only the residual dollar difference, if any.
             unit = (m["buy_amount"] / m["buy_qty"]) if m.get("buy_qty") else 0.0
             if unit <= 0:
                 unit = m["amount"] / qty if qty else 0.0
-            payload.append({
-                "name": m["name"],
-                "description": marker,
-                "part_number": m["sku"],
-                "quantity": qty,
-                "unit_cost": int(round(unit * 100)),
-            })
+            if qty:
+                payload.append({
+                    "name": m["name"],
+                    "description": marker,
+                    "part_number": m["sku"],
+                    "quantity": qty,
+                    "unit_cost": int(round(unit * 100)),
+                })
             residual = m["amount"] - unit * qty
             if abs(residual) >= 0.50:
                 payload.append({
@@ -7813,8 +7826,15 @@ async def hcp_check_setup() -> str:
                          + ", ".join(unknown_keys))
             advice.append("Remove or correct the unrecognised job_cost_import "
                           "keys — they do nothing.")
-    lines.append(f"║      tool threshold ${float(imp.get('tool_threshold_dollars', 150.0)):,.2f}"
-                 f"  |  amount basis: {imp.get('amount_basis', 'retail')}")
+    try:
+        tool_threshold = float(imp.get("tool_threshold_dollars", 150.0))
+        lines.append(f"║      tool threshold ${tool_threshold:,.2f}"
+                     f"  |  amount basis: {imp.get('amount_basis', 'retail')}")
+    except (TypeError, ValueError):
+        lines.append(f"║  ⚠ job_cost_import.tool_threshold_dollars is not a number "
+                     f"({imp.get('tool_threshold_dollars')!r})")
+        advice.append("Fix job_cost_import.tool_threshold_dollars in config.json — "
+                      "it must be a plain number.")
     lines.append(f"║      ledger: {_ledger_path()}")
 
     # ── verdict ──────────────────────────────────────────────────────────────
