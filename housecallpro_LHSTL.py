@@ -7834,5 +7834,153 @@ async def hcp_check_setup() -> str:
     return "\n".join(lines)
 
 
+# ── Payments received (cash basis, for royalty-aligned reporting) ─────────────
+#
+# Franchise royalties are computed on a CASH-RECEIPTS basis: every payment
+# counts on the day it was received, and the 3% card surcharge is part of the
+# royalty base. Job totals by scheduled month do not tie to that, so any
+# revenue-by-territory or revenue-by-month view that has to agree with the
+# royalty reports must start from payments, not jobs.
+#
+# One row per payment, from EVERY invoice on every job (deposit, progress and
+# final invoices all carry their own payments). The job's service ZIP rides
+# along so the caller can map the payment to a territory.
+
+@mcp.tool()
+async def hcp_payments_received(
+    start_date: str,
+    end_date: str,
+    lookback_days: Optional[int] = 400,
+    out_csv: Optional[str] = None,
+) -> str:
+    """
+    Every payment received between two dates, one row per payment, with the job's
+    service ZIP. Cash basis — use this for anything that must tie to royalty reports.
+
+    Args:
+        start_date: First payment date, YYYY-MM-DD (America/Chicago)
+        end_date: Last payment date, YYYY-MM-DD, inclusive
+        lookback_days: How far before start_date to look for jobs whose payments
+            might land in the window (default 400)
+        out_csv: Optional absolute path on this computer to write the rows as CSV
+
+    Columns: paid_date, paid_at, amount, surcharge, gross (amount + surcharge,
+    the royalty basis), method, status, invoice_number, job_number, job_id,
+    customer, street, city, zip
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("America/Chicago")
+    d0 = date.fromisoformat(start_date)
+    d1 = date.fromisoformat(end_date)
+    jmin = (d0 - timedelta(days=_as_int(lookback_days, 400))).isoformat()
+    jmax = (d1 + timedelta(days=120)).isoformat()
+
+    notes: list[str] = []
+    async with _hcp_client() as client:
+        # 1. every job that could carry a payment in the window, all pages
+        jobs, page = [], 1
+        while page <= 80:
+            data, err = await _get_json(client, "/jobs", params={
+                "scheduled_start_min": f"{jmin}T00:00:00Z",
+                "scheduled_start_max": f"{jmax}T23:59:59Z",
+                "page": page, "page_size": 100})
+            if err:
+                notes.append(f"job list page {page} failed ({err}) — RESULT IS INCOMPLETE")
+                break
+            jobs.extend(data.get("jobs", []))
+            if page >= (data.get("total_pages") or 1):
+                break
+            page += 1
+        # unscheduled jobs can still take deposits
+        page = 1
+        seen = {j.get("id") for j in jobs}
+        while page <= 20:
+            data, err = await _get_json(client, "/jobs", params={
+                "work_status[]": ["unscheduled"], "page": page, "page_size": 100})
+            if err:
+                notes.append(f"unscheduled job page {page} failed ({err})")
+                break
+            for j in data.get("jobs", []):
+                if j.get("id") not in seen:
+                    jobs.append(j); seen.add(j.get("id"))
+            if page >= (data.get("total_pages") or 1):
+                break
+            page += 1
+
+        # 2. every invoice on every job, throttled; failures are named, never zeroed
+        fetched = await _fanout_jobs(client, jobs, ["/invoices"])
+
+    rows, failed = [], []
+    for job, ((inv_data, err),) in zip(jobs, fetched):
+        if err:
+            failed.append(str(job.get("invoice_number") or job.get("id")))
+            continue
+        if isinstance(inv_data, list):
+            invoices = inv_data
+        else:
+            inv_data = inv_data or {}
+            invoices = inv_data.get("invoices") or ([inv_data] if inv_data.get("id") else [])
+        cust = job.get("customer") or {}
+        addr = job.get("address") or {}
+        for inv in invoices:
+            if not isinstance(inv, dict):
+                continue
+            for p in inv.get("payments") or []:
+                if not isinstance(p, dict) or not p.get("paid_at"):
+                    continue
+                try:
+                    local = dt.fromisoformat(str(p["paid_at"]).replace("Z", "+00:00")).astimezone(tz)
+                except ValueError:
+                    continue
+                if not (d0 <= local.date() <= d1):
+                    continue
+                amt = int(p.get("amount") or 0)
+                sur = int(p.get("surcharge_fee_amount") or 0)
+                rows.append({
+                    "paid_date": local.date().isoformat(),
+                    "paid_at": local.isoformat(timespec="seconds"),
+                    "amount": f"{amt/100:.2f}",
+                    "surcharge": f"{sur/100:.2f}",
+                    "gross": f"{(amt+sur)/100:.2f}",
+                    "method": p.get("payment_method") or "",
+                    "status": p.get("status") or "",
+                    "invoice_number": str(inv.get("invoice_number") or ""),
+                    "job_number": str(job.get("invoice_number") or ""),
+                    "job_id": job.get("id") or "",
+                    "customer": f"{cust.get('first_name','')} {cust.get('last_name','')}".strip(),
+                    "street": addr.get("street") or "",
+                    "city": addr.get("city") or "",
+                    "zip": (addr.get("zip") or "")[:5],
+                })
+    rows.sort(key=lambda r: r["paid_at"])
+    cols = ["paid_date", "paid_at", "amount", "surcharge", "gross", "method", "status",
+            "invoice_number", "job_number", "job_id", "customer", "street", "city", "zip"]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=cols)
+    w.writeheader(); w.writerows(rows)
+    if out_csv:
+        Path(out_csv).expanduser().write_text(buf.getvalue())
+
+    ok = [r for r in rows if r["status"] == "succeeded"]
+    by_status: dict = {}
+    for r in rows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+    head = [
+        f"Payments received {start_date} to {end_date}: {len(rows)} rows "
+        "(" + ", ".join(f"{k or 'blank'} {v}" for k, v in sorted(by_status.items())) + ")",
+        f"Succeeded: amount ${sum(float(r['amount']) for r in ok):,.2f}  +  surcharge "
+        f"${sum(float(r['surcharge']) for r in ok):,.2f}  =  gross "
+        f"${sum(float(r['gross']) for r in ok):,.2f}",
+        f"Jobs scanned: {len(jobs)} (scheduled {jmin} to {jmax}, plus unscheduled)",
+    ]
+    if failed:
+        head.append(f"⚠ {len(failed)} job(s) failed to load and are EXCLUDED: {', '.join(failed[:30])}")
+    head += notes
+    if out_csv:
+        head.append(f"Wrote {out_csv}")
+        return "\n".join(head)
+    return "\n".join(head) + "\n\n" + buf.getvalue()
+
+
 if __name__ == "__main__":
     mcp.run()
