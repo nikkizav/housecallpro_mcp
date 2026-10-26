@@ -161,14 +161,44 @@ again** (this matters — it won't work otherwise). Then check it worked:
 uv --version
 ```
 
-If you see a version number, you're good. If you see "command not found," close
-and reopen Terminal once more.
+**Type this one by hand** rather than copying it from an email or document — it
+has **two dashes** before `version`, and email and Word often turn two dashes into
+one long dash, which makes the command fail. (`uv -version` with one dash also
+fails.)
+
+If you see a version number (something like `uv 0.10.10`), you're good.
+
+**If you see "command not found" (Mac):**
+
+1. Quit Terminal completely (`Cmd + Q`, not just closing the window), reopen it,
+   and try again.
+2. Still nothing? Run this to see whether the install worked:
+
+   ```bash
+   ~/.local/bin/uv --version
+   ```
+
+   If that prints a version, `uv` is installed but your Terminal can't find it.
+   Run `source ~/.local/bin/env`, then `uv --version` again. (That fix only lasts
+   for this window; the installer normally makes it permanent, so reopening
+   Terminal is enough next time.)
+3. If it says "No such file," the install didn't finish. Run the install line
+   again and read the last few lines of what it prints.
+
+**If you see "not recognized" (Windows):** close and reopen PowerShell, then try
+again. If the install line itself printed a red error mentioning *execution
+policy* or *running scripts*, your computer is blocking it — ask whoever manages
+your computer, or send us a screenshot.
+
+Stuck at any point? Send a screenshot of the whole Terminal window — what it
+printed is the fastest way to see what went wrong.
 
 ### Step 4 — Download and set up
 
 Download this project: click the green **Code** button at the top of this page →
-**Download ZIP**. Unzip it, and move the resulting folder somewhere you'll find
-again — your Documents folder is fine.
+**Download ZIP**. Unzip it (double-click on Mac; on Windows right-click →
+**Extract All**), and move the resulting folder somewhere you'll find again — your
+Documents folder is fine.
 
 **Two things that trip people up here:**
 
@@ -362,12 +392,13 @@ you give up. Pick **Allow for this task** and it runs.
 The pop-up names the tool it wants to run, and the name tells you what it does:
 
 - **`hcp_list_…`, `hcp_get_…`, `hcp_time_variance`, `hcp_post_job_analysis`** —
-  these only look things up. 32 of the 56 tools are read-only. Nothing you approve
+  these only look things up. 34 of the 60 tools are read-only. Nothing you approve
   here can change anything.
 - **`hcp_create_…`, `hcp_update_…`, `hcp_delete_…`, `hcp_add_…`, `hcp_remove_…`,
-  `hcp_set_…`, `hcp_write_estimate`, `hcp_finalize_estimate`,
-  `hcp_approve_estimate_option`** — these **change your Housecall Pro data**. There
-  are 24 of them. Read what it says before allowing.
+  `hcp_set_…`, `hcp_convert_lead`, `hcp_adjust_job_materials`,
+  `hcp_import_job_costs`, `hcp_upload_estimate_pdf`, `hcp_write_estimate`,
+  `hcp_finalize_estimate`, `hcp_approve_estimate_option`** — these **change your
+  Housecall Pro data**. There are 26 of them. Read what it says before allowing.
 
 If you asked a question and it wants to *change* something, that's worth a second
 look — say Deny and ask what it's trying to do.
@@ -730,7 +761,7 @@ Added or lost a tech? Re-run the setup wizard, then `hcp_check_setup`.
 
 Everything below is optional.
 
-**Architecture.** One server, `housecallpro_LHSTL.py`, with 59 tools returning
+**Architecture.** One server, `housecallpro_LHSTL.py`, with 60 tools returning
 formatted, readable output. There is nothing else to register.
 
 **Pulling data out for your own analysis.** `export.py` writes a date range of

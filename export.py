@@ -44,6 +44,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import housecallpro_LHSTL as H   # noqa: E402  (path set above)
 
+# Set from --rate; None means fall back to the config.
+_RATE: float | None = None
+# id -> name, filled once in run() so dispatch rows carry people, not UUIDs.
+_EMP_MAP: dict = {}
+
 
 async def _all_jobs(client, start: str, end: str, quiet: bool) -> tuple[list, list]:
     """Every job scheduled in the window, following pagination to the end."""
@@ -89,10 +94,24 @@ def _row(job: dict, appts: list, items: list, invoices: list,
     C = lambda k: round((money.get(k) or 0) / 100, 2)
 
     est = H._estimate_job_time(job, appts, items, cfg)
-    hours = est.get("actual") or 0.0
-    rate = float(cfg.get("labor_cost_per_hour") or 0)
+    # On a 'scheduled' or 'unmeasurable' row est["actual"] IS the schedule, so
+    # say so in a column rather than passing it off as worked time.
+    grade = est.get("grade", "")
+    if grade in ("measured", "estimated"):
+        hours, hours_basis = (est.get("actual") or 0.0), "actual"
+    else:
+        hours, hours_basis = (est.get("scheduled") or 0.0), "schedule"
+
+    # run() puts the config's blended rate on cfg as labor_cost_per_hour.
+    # --rate overrides it so a run can be costed at the DIRECT loaded rate
+    # without editing the config the MCP server also reads.
+    rate = _RATE if _RATE is not None else float(cfg.get("labor_cost_per_hour") or 0)
+    if not rate:
+        raise SystemExit("No labor rate: pass --rate, or set "
+                         "scheduling.blended_cost_per_tech_hour in the config.")
     labor_cost = hours * rate
     collected = C("collected")
+    contract = C("contract")
 
     return {
         "job_number": num,
@@ -122,11 +141,56 @@ def _row(job: dict, appts: list, items: list, invoices: list,
         "materials_billed": round(mat_billed, 2),
         "labor_cost": round(labor_cost, 2),
         "materials_cost": round(mat_cost, 2),
-        "gross_profit": round(collected - labor_cost - mat_cost, 2),
+        # Job costing asks what the work earned, so this is contract value less
+        # cost. cash_profit is the same sum on money actually in the bank; a job
+        # that is done but unpaid shows healthy here and thin there, which is the
+        # honest pair. The old single figure used collected and made every
+        # work-in-progress job look like a loss.
+        "gross_profit": round(contract - labor_cost - mat_cost, 2),
+        "cash_profit": round(collected - labor_cost - mat_cost, 2),
+        "labor_rate_used": rate,
+        "hours_basis": hours_basis,
         "appointments": len(appts),
         "line_items": len(items),
         "posted_materials": len(materials),
     }
+
+
+def _dispatch_rows(job: dict, appts: list, emp_map: dict) -> list[dict]:
+    """One row per appointment per dispatched tech.
+
+    This is the grain the job rows cannot carry. A job row has ONE crew size and
+    ONE span; a week-long job with three different people on three different days
+    collapses into a single number there. Here each day keeps its own tech, so a
+    rebuild can cost a job at the rates of the people who were actually on it and
+    can show a multi-day job day by day.
+
+    Booked hours only. Housecall Pro stamps one start and one finish per JOB, so
+    there is no per-appointment clock to read and none is invented here.
+    """
+    num = str(job.get("invoice_number") or job.get("id"))
+    out = []
+    for a in appts:
+        s_raw, e_raw = a.get("start_time"), a.get("end_time")
+        s_dt, e_dt = H._dtp(s_raw), H._dtp(e_raw)
+        span = H._span_h(s_dt, e_dt)
+        names = [(e.get("first_name", "") + " " + e.get("last_name", "")).strip()
+                 for e in (a.get("assigned_employees") or [])]
+        if not names:
+            names = [emp_map.get(i, i) for i in (a.get("dispatched_employees_ids") or [])]
+        # An appointment with nobody dispatched is recorded as such rather than
+        # charged to the job's assignees — doing that is what put 17 phantom
+        # hours on Elliott in the capacity work.
+        for nm in (names or ["(undispatched)"]):
+            out.append({
+                "job_number": num,
+                "date": str(s_raw or "")[:10],
+                "tech": nm,
+                "booked_hours": round(span or 0.0, 2),
+                "appointment_id": a.get("id", ""),
+                "dispatched": bool(names),
+            })
+    return out
 
 
 def _assemble(jobs: list, results: list, cfg: dict) -> tuple[list, list, list]:
@@ -142,6 +206,7 @@ def _assemble(jobs: list, results: list, cfg: dict) -> tuple[list, list, list]:
     never reach a row as a zero.
     """
     rows, excluded, quirks = [], [], []
+    _assemble.dispatch = getattr(_assemble, "dispatch", [])
     for job, four in zip(jobs, results):
         num = str(job.get("invoice_number") or job.get("id"))
         (ap, ap_err), (li, li_err), (inv, inv_err), (mat, mat_err) = four
@@ -154,9 +219,11 @@ def _assemble(jobs: list, results: list, cfg: dict) -> tuple[list, list, list]:
         if errs:
             excluded.append((num, ", ".join(sorted(set(errs)))))
             continue
+        _appts = (ap or {}).get("appointments") or []
+        _assemble.dispatch.extend(_dispatch_rows(job, _appts, _EMP_MAP))
         rows.append(_row(
             job,
-            (ap or {}).get("appointments") or [],
+            _appts,
             li.get("data") or li.get("line_items") or [],
             inv.get("invoices") or inv.get("data") or [],
             mat.get("job_input_materials") or [],
@@ -172,6 +239,14 @@ async def run(start: str, end: str, out: str, quiet: bool) -> int:
     cfg["labor_cost_per_hour"] = float(
         (raw.get("scheduling") or {}).get("blended_cost_per_tech_hour", 95.0))
     async with H._hcp_client() as client:
+        try:
+            emp = await H._get(client, "/employees", {"page_size": 100})
+            _EMP_MAP.update({
+                e["id"]: (e.get("first_name", "") + " " + e.get("last_name", "")).strip()
+                for e in emp.get("employees", [])})
+        except Exception as exc:        # names are a nicety; ids still export
+            print(f"  ⚠ employee names unavailable ({exc}); dispatch rows keep ids",
+                  file=sys.stderr)
         if not quiet:
             print(f"Fetching jobs {start} → {end}…", file=sys.stderr)
         jobs, notes = await _all_jobs(client, start, end, quiet)
@@ -228,8 +303,20 @@ async def run(start: str, end: str, out: str, quiet: bool) -> int:
             w.writeheader()
             w.writerows(rows)
 
+    disp = getattr(_assemble, "dispatch", [])
+    if disp:
+        disp.sort(key=lambda d: (d["date"], d["job_number"], d["tech"]))
+        dpath = stem.with_name(stem.name + "_dispatch").with_suffix(".csv")
+        with open(dpath, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(disp[0].keys()))
+            w.writeheader(); w.writerows(disp)
+
     print(f"\n{len(rows)} jobs → {stem.with_suffix('.json')} and "
           f"{stem.with_suffix('.csv')}")
+    if disp:
+        undis = sum(1 for d in disp if not d["dispatched"])
+        print(f"  {len(disp)} appointment-tech rows → {dpath}"
+              + (f"   ⚠ {undis} undispatched" if undis else ""))
     graded: dict = {}
     for r in rows:
         graded[r["time_grade"]] = graded.get(r["time_grade"], 0) + 1
@@ -263,7 +350,14 @@ def main() -> int:
     p.add_argument("--out", default="hcp_export",
                    help="Output path without extension (default: hcp_export)")
     p.add_argument("--quiet", action="store_true", help="No progress output")
+    p.add_argument("--rate", type=float, default=None,
+                   help="Labor cost per tech-hour. Overrides the config. Use the "
+                        "DIRECT loaded rate (49.40 as of Dom, Sep 25 2026) for job "
+                        "margin; the config's 95.00 is fully loaded and nets out "
+                        "overhead too.")
     a = p.parse_args()
+    global _RATE
+    _RATE = a.rate
     return asyncio.run(run(a.start, a.end, a.out, a.quiet))
 
 
